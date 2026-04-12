@@ -1,0 +1,2516 @@
+#!/usr/bin/ksh
+# =============================================================================
+# artix-fluxbox-setup.ksh
+# Artix Linux OpenRC x86_64 — Fluxbox Daily-Driver Desktop Post-Installation
+# =============================================================================
+# Version   : 1.0.0
+# Shell     : Korn Shell (mksh compatible)
+# Platform  : Artix Linux, OpenRC, x86_64
+#
+# Usage:
+#   artix-fluxbox-setup.ksh -u <user> -k <layout> [-V <variant>]
+#                           [-m <model>] [-o <xkboptions>] [-f] [-h]
+#
+#   -u <user>       Target username (REQUIRED)
+#   -k <layout>     X11 keyboard layout (REQUIRED, e.g. us br de fr pt)
+#   -V <variant>    X11 keyboard variant (optional, e.g. intl abnt2 dvorak)
+#   -m <model>      X11 keyboard model   (optional, e.g. pc105 pc104)
+#   -o <options>    X11 keyboard options (optional, e.g. grp:alt_shift_toggle)
+#   -f              Force re-run all stages (ignore checkpoints)
+#   -h              Show help and exit
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# SECTION 1 — SHELL INITIALISATION
+# ---------------------------------------------------------------------------
+
+# Disable errexit globally; we manage every exit code explicitly.
+# This avoids silent bail-outs from pipeline subshells in mksh.
+set +e
+
+# Treat unset variables as errors.
+set -o nounset
+
+# Prevent glob expansion on unmatched patterns (mksh: set -o noglob when needed).
+# We keep globbing available but use it carefully.
+
+# Pipeline: in mksh the exit code of a pipeline is the last command.
+# We check pipeline results explicitly.
+
+# ---------------------------------------------------------------------------
+# SECTION 2 — CONSTANTS AND GLOBAL STATE
+# ---------------------------------------------------------------------------
+
+readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
+readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_PID=$$
+
+# Directories
+readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
+readonly BACKUP_DIR="/var/backups/artix-fluxbox-setup"
+readonly LOG_DIR="/var/log"
+readonly LOGFILE="${LOG_DIR}/artix-fluxbox-setup.log"
+readonly TMP_DIR="/tmp/artix-fluxbox-setup-${SCRIPT_PID}"
+
+# Checkpoint files live in STATE_DIR; each stage writes one on success.
+readonly STAGE_PREFIX="${STATE_DIR}/stage_"
+readonly STAGE_SUFFIX=".done"
+
+# Runtime globals (set by argument parsing and discovery)
+TARGET_USER=""
+TARGET_HOME=""
+TARGET_UID=""
+TARGET_GID=""
+KBD_LAYOUT=""
+KBD_VARIANT=""
+KBD_MODEL="pc105"
+KBD_OPTIONS=""
+FORCE_RERUN=0
+
+# Hardware findings (populated by hardware discovery stage)
+HW_ARCH=""
+HW_CPU_VENDOR=""
+HW_CPU_MODEL=""
+HW_IS_INTEL_CPU=0
+HW_GPU_LINE=""
+HW_IS_INTEL_GPU=0
+HW_GPU_DRIVER_RECOMMENDED="modesetting"
+HW_IS_LAPTOP=0
+HW_HAS_BATTERY=0
+HW_HAS_BACKLIGHT=0
+HW_AUDIO_CONTROLLERS=""
+HW_HAS_AUDIO=0
+HW_NET_ADAPTERS=""
+HW_HAS_WIRELESS=0
+HW_LOADED_GFX_MODULES=""
+
+# Package outcome tracking
+PKG_INTEL_GPU_AVAILABLE=0
+PKG_AUDIO_AVAILABLE=0
+
+# ---------------------------------------------------------------------------
+# SECTION 3 — COLOUR / TTY CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Detect whether stdout is a terminal; suppress colour if piped.
+if [ -t 1 ]; then
+    C_RST="\033[0m"
+    C_BOLD="\033[1m"
+    C_DIM="\033[2m"
+    C_RED="\033[31m"
+    C_GREEN="\033[32m"
+    C_YELLOW="\033[33m"
+    C_BLUE="\033[34m"
+    C_MAGENTA="\033[35m"
+    C_CYAN="\033[36m"
+    C_WHITE="\033[37m"
+    C_BWHITE="\033[97m"
+else
+    C_RST="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW=""
+    C_BLUE="" C_MAGENTA="" C_CYAN="" C_WHITE="" C_BWHITE=""
+fi
+
+readonly C_RST C_BOLD C_DIM C_RED C_GREEN C_YELLOW
+readonly C_BLUE C_MAGENTA C_CYAN C_WHITE C_BWHITE
+
+# ---------------------------------------------------------------------------
+# SECTION 4 — TTY UI FUNCTIONS
+# ---------------------------------------------------------------------------
+
+# Print a horizontal rule
+ui_rule() {
+    print -- "${C_DIM}────────────────────────────────────────────────────────────────${C_RST}"
+}
+
+# Print the startup banner
+ui_banner() {
+    print ""
+    print -- "${C_BOLD}${C_CYAN}╔══════════════════════════════════════════════════════════════╗${C_RST}"
+    print -- "${C_BOLD}${C_CYAN}║  Artix Linux OpenRC — Fluxbox Desktop Post-Install  v${SCRIPT_VERSION}   ║${C_RST}"
+    print -- "${C_BOLD}${C_CYAN}╚══════════════════════════════════════════════════════════════╝${C_RST}"
+    print ""
+}
+
+# Print a stage header
+# ui_stage <number> <name>
+ui_stage() {
+    typeset num="$1" name="$2"
+    print ""
+    print -- "${C_BOLD}${C_BLUE}┌─ Stage ${num}: ${name}${C_RST}"
+    ui_rule
+}
+
+# Print a sub-step label
+# ui_step <message>
+ui_step() {
+    print -- "  ${C_CYAN}→${C_RST}  $*"
+}
+
+# Status indicators
+ui_ok()   { print -- "  ${C_GREEN}[OK]${C_RST}   $*"; }
+ui_warn() { print -- "  ${C_YELLOW}[WARN]${C_RST} $*"; }
+ui_fail() { print -- "  ${C_RED}[FAIL]${C_RST} $*"; }
+ui_skip() { print -- "  ${C_DIM}[SKIP]${C_RST} $*"; }
+ui_info() { print -- "  ${C_BLUE}[INFO]${C_RST} $*"; }
+
+# Print a key=value summary line
+ui_kv() {
+    typeset key="$1" val="$2"
+    print -- "  ${C_BOLD}${key}:${C_RST} ${val}"
+}
+
+# Print a section separator
+ui_sep() {
+    print ""
+    ui_rule
+    print ""
+}
+
+# Fatal error — print, log, and exit
+# ui_fatal <message>
+ui_fatal() {
+    print ""
+    print -- "${C_BOLD}${C_RED}╔══════════════════════════════════════╗${C_RST}"
+    print -- "${C_BOLD}${C_RED}║  FATAL ERROR — setup cannot continue ║${C_RST}"
+    print -- "${C_BOLD}${C_RED}╚══════════════════════════════════════╝${C_RST}"
+    print -- "  ${C_RED}$*${C_RST}"
+    print ""
+    log_error "FATAL: $*"
+}
+
+# Print a final summary box
+# ui_final_ok <message>
+ui_final_ok() {
+    print ""
+    print -- "${C_BOLD}${C_GREEN}╔══════════════════════════════════════════════════════════════╗${C_RST}"
+    print -- "${C_BOLD}${C_GREEN}║  SETUP COMPLETE — Fluxbox desktop ready. Reboot to start.   ║${C_RST}"
+    print -- "${C_BOLD}${C_GREEN}╚══════════════════════════════════════════════════════════════╝${C_RST}"
+    print ""
+}
+
+ui_final_fail() {
+    print ""
+    print -- "${C_BOLD}${C_RED}╔══════════════════════════════════════════════════════════════╗${C_RST}"
+    print -- "${C_BOLD}${C_RED}║  SETUP INCOMPLETE — review log and re-run to resume.         ║${C_RST}"
+    print -- "${C_BOLD}${C_RED}╚══════════════════════════════════════════════════════════════╝${C_RST}"
+    print ""
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 5 — LOGGING FUNCTIONS
+# ---------------------------------------------------------------------------
+
+# Initialise the log file (called after STATE_DIR is confirmed writable).
+log_init() {
+    typeset ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    print -- "# ============================================================" >> "${LOGFILE}"
+    print -- "# ${SCRIPT_NAME} ${SCRIPT_VERSION} — started ${ts}" >> "${LOGFILE}"
+    print -- "# PID: ${SCRIPT_PID}" >> "${LOGFILE}"
+    print -- "# ============================================================" >> "${LOGFILE}"
+}
+
+# Core log writer — never fails
+_log() {
+    typeset level="$1"; shift
+    typeset ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    print -- "[${ts}] [${level}] $*" >> "${LOGFILE}" 2>/dev/null || true
+}
+
+log_info()    { _log INFO    "$*"; }
+log_warn()    { _log WARN    "$*"; }
+log_error()   { _log ERROR   "$*"; }
+log_debug()   { _log DEBUG   "$*"; }
+log_stage()   { _log STAGE   "=== $* ==="; }
+log_cmd()     { _log CMD     "$*"; }
+log_result()  { _log RESULT  "exit=$1 for: $2"; }
+log_hw()      { _log HW      "$*"; }
+log_pkg()     { _log PKG     "$*"; }
+log_svc()     { _log SVC     "$*"; }
+log_file()    { _log FILE    "$*"; }
+log_backup()  { _log BACKUP  "$*"; }
+log_chk()     { _log CHKPT   "$*"; }
+
+# ---------------------------------------------------------------------------
+# SECTION 6 — CHECKPOINT / RESUME FUNCTIONS
+# ---------------------------------------------------------------------------
+
+# Return the checkpoint file path for a stage tag.
+# chk_file <tag>  e.g. chk_file "03_packages"
+chk_file() {
+    print -- "${STAGE_PREFIX}${1}${STAGE_SUFFIX}"
+}
+
+# Return 0 (true) if a stage checkpoint exists AND force-rerun is not set.
+chk_done() {
+    typeset tag="$1"
+    if [ "${FORCE_RERUN}" -eq 1 ]; then
+        return 1
+    fi
+    [ -f "$(chk_file "${tag}")" ]
+}
+
+# Mark a stage as complete.
+chk_mark() {
+    typeset tag="$1"
+    typeset ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    print -- "${ts}" > "$(chk_file "${tag}")"
+    log_chk "Marked complete: ${tag}"
+}
+
+# Remove a stage checkpoint (for forced rerun).
+chk_clear() {
+    typeset tag="$1"
+    rm -f "$(chk_file "${tag}")" 2>/dev/null || true
+    log_chk "Cleared: ${tag}"
+}
+
+# Print resume status to tty if any checkpoints exist.
+chk_show_resume_status() {
+    typeset f count
+    count=0
+    for f in "${STATE_DIR}"/stage_*.done 2>/dev/null; do
+        [ -f "${f}" ] || continue
+        count=$(( count + 1 ))
+    done
+    if [ "${count}" -gt 0 ]; then
+        ui_info "Resuming: ${count} stage(s) already completed."
+        log_info "Resume mode: ${count} checkpoints found."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 7 — UTILITY / SAFETY FUNCTIONS
+# ---------------------------------------------------------------------------
+
+# Run a command, log it, capture stderr, return its exit code.
+# Sets global RC to exit code.
+# run_cmd <description> <cmd> [args...]
+RC=0
+run_cmd() {
+    typeset desc="$1"; shift
+    typeset stderr_tmp="${TMP_DIR}/stderr_$$"
+    log_cmd "${desc}: $*"
+    "$@" 2>"${stderr_tmp}"
+    RC=$?
+    if [ -s "${stderr_tmp}" ]; then
+        log_debug "stderr: $(cat "${stderr_tmp}")"
+    fi
+    rm -f "${stderr_tmp}" 2>/dev/null || true
+    log_result "${RC}" "${desc}"
+    return "${RC}"
+}
+
+# Run a command silently (stdout+stderr to log only).
+run_cmd_quiet() {
+    typeset desc="$1"; shift
+    typeset out_tmp="${TMP_DIR}/out_$$"
+    log_cmd "QUIET ${desc}: $*"
+    "$@" >"${out_tmp}" 2>&1
+    RC=$?
+    if [ -s "${out_tmp}" ]; then
+        log_debug "output: $(cat "${out_tmp}")"
+    fi
+    rm -f "${out_tmp}" 2>/dev/null || true
+    log_result "${RC}" "QUIET ${desc}"
+    return "${RC}"
+}
+
+# Atomic file write: write to .tmp then mv into place.
+# write_file <path> <owner:group> <mode> <content-via-stdin>
+write_file() {
+    typeset path="$1" owner="$2" mode="$3"
+    typeset tmp="${path}.tmp.$$"
+    cat > "${tmp}"
+    chown "${owner}" "${tmp}"
+    chmod "${mode}" "${tmp}"
+    mv -f "${tmp}" "${path}"
+    log_file "Written: ${path} owner=${owner} mode=${mode}"
+}
+
+# Backup a file before modification. Idempotent (backs up once).
+# backup_file <path>
+backup_file() {
+    typeset path="$1"
+    typeset bak="${BACKUP_DIR}$(print -- "${path}" | tr '/' '_').bak"
+    if [ -f "${path}" ] && [ ! -f "${bak}" ]; then
+        cp -a "${path}" "${bak}"
+        log_backup "Backed up: ${path} → ${bak}"
+    fi
+}
+
+# Append a line to a file only if it is not already present.
+# append_if_missing <file> <line>
+append_if_missing() {
+    typeset file="$1" line="$2"
+    if ! grep -qF "${line}" "${file}" 2>/dev/null; then
+        print -- "${line}" >> "${file}"
+        log_file "Appended to ${file}: ${line}"
+    fi
+}
+
+# Create a directory if missing, with correct owner/mode.
+ensure_dir() {
+    typeset path="$1" owner="$2" mode="$3"
+    if [ ! -d "${path}" ]; then
+        mkdir -p "${path}"
+        chown "${owner}" "${path}"
+        chmod "${mode}" "${path}"
+        log_file "Created dir: ${path} owner=${owner} mode=${mode}"
+    fi
+}
+
+# Check if a package is already installed (pacman).
+pkg_installed() {
+    pacman -Qi "$1" >/dev/null 2>&1
+}
+
+# Check if a pacman package exists in available repos.
+pkg_available() {
+    pacman -Si "$1" >/dev/null 2>&1
+}
+
+# Check if an OpenRC service init script exists.
+svc_exists() {
+    [ -f "/etc/init.d/$1" ]
+}
+
+# Check if an OpenRC service is enabled in a runlevel.
+svc_enabled() {
+    typeset svc="$1" runlevel="${2:-default}"
+    [ -L "/etc/runlevels/${runlevel}/${svc}" ]
+}
+
+# Enable an OpenRC service safely.
+svc_enable() {
+    typeset svc="$1" runlevel="${2:-default}"
+    if ! svc_enabled "${svc}" "${runlevel}"; then
+        run_cmd_quiet "Enable ${svc}@${runlevel}" rc-update add "${svc}" "${runlevel}"
+        if [ "${RC}" -eq 0 ]; then
+            log_svc "Enabled: ${svc} in runlevel ${runlevel}"
+            ui_ok "Service enabled: ${svc} (${runlevel})"
+        else
+            log_warn "Failed to enable service: ${svc}"
+            ui_warn "Could not enable service: ${svc}"
+        fi
+    else
+        log_svc "Already enabled: ${svc}@${runlevel}"
+        ui_skip "Service already enabled: ${svc}"
+    fi
+}
+
+# Disable an OpenRC service safely.
+svc_disable() {
+    typeset svc="$1" runlevel="${2:-default}"
+    if svc_enabled "${svc}" "${runlevel}"; then
+        run_cmd_quiet "Disable ${svc}@${runlevel}" rc-update del "${svc}" "${runlevel}"
+        log_svc "Disabled: ${svc} in runlevel ${runlevel}"
+        ui_ok "Service disabled: ${svc} (${runlevel})"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 8 — ARGUMENT PARSING
+# ---------------------------------------------------------------------------
+
+show_help() {
+    print ""
+    print -- "${C_BOLD}${SCRIPT_NAME}${C_RST} ${SCRIPT_VERSION}"
+    print ""
+    print "  Artix Linux OpenRC x86_64 — Fluxbox desktop post-installation."
+    print ""
+    print -- "${C_BOLD}USAGE${C_RST}"
+    print "  ${SCRIPT_NAME} -u <user> -k <layout> [options]"
+    print ""
+    print -- "${C_BOLD}REQUIRED${C_RST}"
+    print "  -u <user>     Target system username"
+    print "  -k <layout>   X11 keyboard layout code (e.g. us  br  de  fr  pt)"
+    print ""
+    print -- "${C_BOLD}OPTIONAL${C_RST}"
+    print "  -V <variant>  X11 keyboard variant  (e.g. intl  abnt2  dvorak)"
+    print "  -m <model>    X11 keyboard model     (default: pc105)"
+    print "  -o <options>  X11 keyboard options   (e.g. grp:alt_shift_toggle)"
+    print "  -f            Force re-run all stages (ignore resume checkpoints)"
+    print "  -h            Show this help and exit"
+    print ""
+    print -- "${C_BOLD}EXAMPLES${C_RST}"
+    print "  ${SCRIPT_NAME} -u alice -k us"
+    print "  ${SCRIPT_NAME} -u bob   -k br -V abnt2"
+    print "  ${SCRIPT_NAME} -u carol -k de -V nodeadkeys -m pc105"
+    print ""
+    print "  Log file:   ${LOGFILE}"
+    print "  State dir:  ${STATE_DIR}"
+    print "  Backup dir: ${BACKUP_DIR}"
+    print ""
+}
+
+parse_args() {
+    typeset opt
+    while getopts "u:k:V:m:o:fh" opt; do
+        case "${opt}" in
+            u) TARGET_USER="${OPTARG}" ;;
+            k) KBD_LAYOUT="${OPTARG}" ;;
+            V) KBD_VARIANT="${OPTARG}" ;;
+            m) KBD_MODEL="${OPTARG}" ;;
+            o) KBD_OPTIONS="${OPTARG}" ;;
+            f) FORCE_RERUN=1 ;;
+            h) show_help; exit 0 ;;
+            ?) show_help; exit 2 ;;
+        esac
+    done
+    shift $(( OPTIND - 1 ))
+
+    # Require both -u and -k
+    if [ -z "${TARGET_USER}" ] || [ -z "${KBD_LAYOUT}" ]; then
+        print -- "${C_RED}ERROR: -u <user> and -k <layout> are both required.${C_RST}" >&2
+        print ""
+        show_help
+        exit 2
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 9 — VALIDATION FUNCTIONS
+# ---------------------------------------------------------------------------
+
+# Validate that the target user exists and is safe to configure.
+validate_target_user() {
+    ui_step "Validating target user: ${TARGET_USER}"
+
+    # Reject obviously malformed names
+    case "${TARGET_USER}" in
+        *[!a-z0-9_-]*) ui_fatal "Target user '${TARGET_USER}' contains invalid characters."; return 1 ;;
+        -*)            ui_fatal "Target user name must not start with '-'."; return 1 ;;
+        root)          ui_fatal "Target user must not be root."; return 1 ;;
+    esac
+    if [ "${#TARGET_USER}" -gt 32 ]; then
+        ui_fatal "Target user name is too long (max 32 chars)."
+        return 1
+    fi
+
+    # User must exist
+    if ! id "${TARGET_USER}" >/dev/null 2>&1; then
+        ui_fatal "User '${TARGET_USER}' does not exist. Create the user first."
+        return 1
+    fi
+
+    # Resolve home, uid, gid
+    TARGET_HOME=$(getent passwd "${TARGET_USER}" | cut -d: -f6)
+    TARGET_UID=$(id -u "${TARGET_USER}")
+    TARGET_GID=$(id -g "${TARGET_USER}")
+
+    if [ -z "${TARGET_HOME}" ] || [ ! -d "${TARGET_HOME}" ]; then
+        ui_fatal "Home directory '${TARGET_HOME}' for user '${TARGET_USER}' does not exist."
+        return 1
+    fi
+
+    log_info "Target user validated: ${TARGET_USER} uid=${TARGET_UID} gid=${TARGET_GID} home=${TARGET_HOME}"
+    ui_ok "User: ${TARGET_USER} (uid=${TARGET_UID}, home=${TARGET_HOME})"
+    return 0
+}
+
+# Validate keyboard layout against installed XKB symbols.
+validate_keyboard() {
+    ui_step "Validating keyboard layout: ${KBD_LAYOUT}"
+
+    # Layout name must be safe characters only
+    case "${KBD_LAYOUT}" in
+        *[!a-z0-9_-]*) ui_fatal "Keyboard layout '${KBD_LAYOUT}' contains invalid characters."; return 1 ;;
+    esac
+
+    typeset xkb_sym_dir="/usr/share/X11/xkb/symbols"
+
+    # xkb symbols may not exist yet if xorg isn't installed; we allow that.
+    if [ -d "${xkb_sym_dir}" ]; then
+        if [ ! -f "${xkb_sym_dir}/${KBD_LAYOUT}" ]; then
+            ui_fatal "XKB layout '${KBD_LAYOUT}' not found in ${xkb_sym_dir}."
+            return 1
+        fi
+        ui_ok "XKB layout file found: ${xkb_sym_dir}/${KBD_LAYOUT}"
+    else
+        ui_info "XKB symbols dir not yet present; layout will be validated post-install."
+        log_info "Deferred keyboard layout validation (xorg not yet installed)."
+    fi
+
+    # Validate variant if given
+    if [ -n "${KBD_VARIANT}" ]; then
+        case "${KBD_VARIANT}" in
+            *[!a-z0-9_-]*) ui_fatal "Keyboard variant '${KBD_VARIANT}' contains invalid characters."; return 1 ;;
+        esac
+    fi
+
+    # Validate model if given
+    if [ -n "${KBD_MODEL}" ]; then
+        case "${KBD_MODEL}" in
+            *[!a-z0-9_-]*) ui_fatal "Keyboard model '${KBD_MODEL}' contains invalid characters."; return 1 ;;
+        esac
+    fi
+
+    log_info "Keyboard validated: layout=${KBD_LAYOUT} variant=${KBD_VARIANT} model=${KBD_MODEL} options=${KBD_OPTIONS}"
+    ui_ok "Keyboard: layout=${KBD_LAYOUT} variant=${KBD_VARIANT:-none} model=${KBD_MODEL}"
+    return 0
+}
+
+# Validate Artix Linux identity.
+validate_artix_identity() {
+    ui_step "Validating Artix Linux identity"
+
+    if [ ! -f /etc/artix-release ] && [ ! -f /etc/os-release ]; then
+        ui_fatal "Cannot identify OS. /etc/artix-release and /etc/os-release both missing."
+        return 1
+    fi
+
+    typeset os_id=""
+    if [ -f /etc/os-release ]; then
+        os_id=$(. /etc/os-release 2>/dev/null && print -- "${ID:-}")
+    fi
+    if [ -f /etc/artix-release ]; then
+        # Artix-release file is definitive
+        log_info "Found /etc/artix-release: $(cat /etc/artix-release | head -1)"
+        ui_ok "Artix Linux identity confirmed via /etc/artix-release"
+        return 0
+    fi
+    if [ "${os_id}" = "artix" ]; then
+        log_info "Artix confirmed via /etc/os-release ID=artix"
+        ui_ok "Artix Linux identity confirmed via /etc/os-release"
+        return 0
+    fi
+
+    ui_fatal "This does not appear to be Artix Linux (ID='${os_id}'). Refusing to continue."
+    return 1
+}
+
+# Validate OpenRC is the active init.
+validate_openrc() {
+    ui_step "Validating OpenRC init system"
+
+    # PID 1 should be openrc-init or a shell that loaded openrc
+    typeset init1=""
+    if [ -f /proc/1/comm ]; then
+        init1=$(cat /proc/1/comm 2>/dev/null || true)
+    fi
+
+    # OpenRC canonical check: /run/openrc/softlevel exists during openrc operation
+    # or rc-status command works
+    if [ -d /run/openrc ] || rc-status >/dev/null 2>&1; then
+        log_info "OpenRC confirmed: /run/openrc present or rc-status responds"
+        ui_ok "OpenRC init system confirmed"
+        return 0
+    fi
+
+    # Secondary check: /sbin/openrc or /usr/sbin/openrc presence + not systemd
+    if [ "${init1}" = "systemd" ]; then
+        ui_fatal "PID 1 is systemd. This script requires OpenRC. Wrong distribution?"
+        return 1
+    fi
+
+    if command -v rc-update >/dev/null 2>&1 && command -v rc-service >/dev/null 2>&1; then
+        log_info "OpenRC tools found (rc-update, rc-service)"
+        ui_ok "OpenRC tools confirmed"
+        return 0
+    fi
+
+    ui_fatal "OpenRC cannot be confirmed. rc-update/rc-service not found."
+    return 1
+}
+
+# Validate x86_64 architecture.
+validate_arch() {
+    ui_step "Validating architecture"
+    typeset arch
+    arch=$(uname -m)
+    HW_ARCH="${arch}"
+    if [ "${arch}" != "x86_64" ]; then
+        ui_fatal "Architecture '${arch}' is not x86_64. Refusing to continue."
+        return 1
+    fi
+    log_hw "Architecture: ${arch}"
+    ui_ok "Architecture: x86_64"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 10 — PREFLIGHT CHECKS
+# ---------------------------------------------------------------------------
+
+stage_preflight() {
+    ui_stage "01" "Preflight Validation"
+    log_stage "PREFLIGHT"
+
+    # Must run as root
+    ui_step "Checking effective user (requires root)"
+    if [ "$(id -u)" -ne 0 ]; then
+        ui_fatal "This script must run as root. Use: sudo ${SCRIPT_NAME} ..."
+        return 1
+    fi
+    ui_ok "Running as root"
+    log_info "Effective UID: 0"
+
+    # Artix identity
+    validate_artix_identity || return 1
+
+    # OpenRC
+    validate_openrc || return 1
+
+    # Architecture
+    validate_arch || return 1
+
+    # Target user
+    validate_target_user || return 1
+
+    # Keyboard
+    validate_keyboard || return 1
+
+    # pacman available
+    ui_step "Checking package manager (pacman)"
+    if ! command -v pacman >/dev/null 2>&1; then
+        ui_fatal "pacman not found. Cannot manage packages."
+        return 1
+    fi
+    ui_ok "pacman found"
+
+    # rc-update available
+    ui_step "Checking service manager (rc-update)"
+    if ! command -v rc-update >/dev/null 2>&1; then
+        ui_fatal "rc-update not found."
+        return 1
+    fi
+    ui_ok "rc-update found"
+
+    # Filesystem write access for critical paths
+    ui_step "Checking filesystem write access"
+    for d in /etc /usr /var; do
+        if ! touch "${d}/.artix_setup_write_test" 2>/dev/null; then
+            ui_fatal "Cannot write to ${d}. Check filesystem state."
+            return 1
+        fi
+        rm -f "${d}/.artix_setup_write_test"
+    done
+    ui_ok "Filesystem writable"
+
+    # Ensure required dirs
+    ui_step "Initialising state and backup directories"
+    mkdir -p "${STATE_DIR}" "${BACKUP_DIR}" "${TMP_DIR}"
+    if [ $? -ne 0 ]; then
+        ui_fatal "Cannot create state/backup/tmp directories."
+        return 1
+    fi
+    chmod 700 "${STATE_DIR}" "${BACKUP_DIR}" "${TMP_DIR}"
+    ui_ok "State dir: ${STATE_DIR}"
+    ui_ok "Backup dir: ${BACKUP_DIR}"
+
+    # Initialise log
+    log_init
+    log_info "Preflight validated."
+
+    # Print configuration summary
+    ui_sep
+    print -- "  ${C_BOLD}Configuration Summary${C_RST}"
+    ui_rule
+    ui_kv "Target user"     "${TARGET_USER} (uid=${TARGET_UID})"
+    ui_kv "Home directory"  "${TARGET_HOME}"
+    ui_kv "Keyboard layout" "${KBD_LAYOUT}"
+    ui_kv "Kbd variant"     "${KBD_VARIANT:-none}"
+    ui_kv "Kbd model"       "${KBD_MODEL}"
+    ui_kv "Kbd options"     "${KBD_OPTIONS:-none}"
+    ui_kv "Force rerun"     "$([ "${FORCE_RERUN}" -eq 1 ] && print yes || print no)"
+    ui_kv "Log file"        "${LOGFILE}"
+    ui_sep
+
+    chk_mark "01_preflight"
+    ui_ok "Preflight complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 11 — HARDWARE DISCOVERY
+# ---------------------------------------------------------------------------
+
+stage_hardware() {
+    ui_stage "02" "Hardware Discovery and Validation"
+    log_stage "HARDWARE"
+
+    # CPU discovery
+    ui_step "Detecting CPU"
+    if [ -f /proc/cpuinfo ]; then
+        HW_CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
+        HW_CPU_VENDOR=$(grep -m1 'vendor_id' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
+    fi
+    if [ -z "${HW_CPU_MODEL}" ]; then
+        HW_CPU_MODEL=$(uname -p)
+        HW_CPU_VENDOR="unknown"
+    fi
+    log_hw "CPU vendor: ${HW_CPU_VENDOR}"
+    log_hw "CPU model: ${HW_CPU_MODEL}"
+    ui_ok "CPU: ${HW_CPU_MODEL}"
+
+    case "${HW_CPU_VENDOR}" in
+        GenuineIntel) HW_IS_INTEL_CPU=1; ui_ok "Intel CPU confirmed" ;;
+        AuthenticAMD) ui_info "AMD CPU detected (Intel targeted; continuing)" ;;
+        *)            ui_info "CPU vendor '${HW_CPU_VENDOR}' (Intel targeted; continuing)" ;;
+    esac
+
+    # Microcode advisory (informational)
+    if [ "${HW_IS_INTEL_CPU}" -eq 1 ]; then
+        if ! pkg_installed intel-ucode; then
+            ui_info "Advisory: intel-ucode not installed. Recommend installing for stability."
+            log_hw "Advisory: intel-ucode absent"
+        else
+            ui_ok "intel-ucode is installed"
+        fi
+    fi
+
+    # GPU discovery via lspci
+    ui_step "Detecting GPU"
+    if command -v lspci >/dev/null 2>&1; then
+        HW_GPU_LINE=$(lspci 2>/dev/null | grep -iE 'VGA compatible|Display controller|3D controller' | head -3 || true)
+    fi
+    log_hw "GPU line(s): ${HW_GPU_LINE}"
+
+    if print -- "${HW_GPU_LINE}" | grep -qi intel; then
+        HW_IS_INTEL_GPU=1
+        ui_ok "Intel GPU detected"
+
+        # Determine recommended X driver based on kernel DRM module
+        HW_LOADED_GFX_MODULES=$(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | grep -E '^(i915|xe|nouveau|amdgpu|radeon)$' | tr '\n' ' ' || true)
+        log_hw "Loaded gfx modules: ${HW_LOADED_GFX_MODULES}"
+
+        # If i915 or xe loaded, modesetting is the correct DDX (modern Intel)
+        if print -- "${HW_LOADED_GFX_MODULES}" | grep -qE 'i915|xe'; then
+            HW_GPU_DRIVER_RECOMMENDED="modesetting"
+            ui_ok "Intel KMS module active (i915/xe) — using modesetting DDX"
+            log_hw "Recommended X driver: modesetting"
+        else
+            HW_GPU_DRIVER_RECOMMENDED="intel"
+            ui_info "No i915/xe detected yet — recommending xf86-video-intel DDX"
+            log_hw "Recommended X driver: intel (xf86-video-intel)"
+        fi
+    else
+        HW_IS_INTEL_GPU=0
+        if [ -n "${HW_GPU_LINE}" ]; then
+            ui_warn "Non-Intel GPU detected: ${HW_GPU_LINE}"
+            ui_warn "This script targets Intel graphics. Continuing in degraded mode."
+            ui_warn "Intel-specific Mesa/Vulkan will not be installed."
+            log_hw "Degraded mode: non-Intel GPU"
+        else
+            ui_warn "No GPU detected via lspci. X may fail to start."
+            log_hw "No GPU found — X startup unreliable"
+        fi
+    fi
+
+    # DRM/KMS state check
+    ui_step "Checking DRM/KMS status"
+    if ls /sys/class/drm/ >/dev/null 2>&1; then
+        typeset drm_cards
+        drm_cards=$(ls /sys/class/drm/ 2>/dev/null | grep -E '^card[0-9]+$' | tr '\n' ' ')
+        log_hw "DRM cards: ${drm_cards}"
+        ui_ok "DRM/KMS: ${drm_cards:-none visible yet}"
+    else
+        ui_info "DRM class not visible (may normalise post-boot with modesetting)"
+    fi
+
+    # Audio discovery
+    ui_step "Detecting audio hardware"
+    if command -v lspci >/dev/null 2>&1; then
+        HW_AUDIO_CONTROLLERS=$(lspci 2>/dev/null | grep -i 'audio\|sound\|multimedia' || true)
+    fi
+    if [ -n "${HW_AUDIO_CONTROLLERS}" ]; then
+        HW_HAS_AUDIO=1
+        log_hw "Audio controllers: ${HW_AUDIO_CONTROLLERS}"
+        ui_ok "Audio hardware found"
+    else
+        # Try ALSA snd devices
+        if ls /proc/asound/ >/dev/null 2>&1; then
+            HW_HAS_AUDIO=1
+            ui_ok "Audio visible via /proc/asound"
+        else
+            ui_warn "No audio hardware detected. Audio may not function."
+            log_hw "No audio detected"
+        fi
+    fi
+
+    # Laptop detection
+    ui_step "Checking laptop/battery indicators"
+    if ls /sys/class/power_supply/ 2>/dev/null | grep -q '^BAT'; then
+        HW_IS_LAPTOP=1
+        HW_HAS_BATTERY=1
+        ui_ok "Battery found — laptop profile"
+        log_hw "Laptop: yes (battery present)"
+    else
+        ui_info "No battery detected — desktop profile"
+        log_hw "Laptop: no"
+    fi
+    if ls /sys/class/backlight/ 2>/dev/null | grep -q '.'; then
+        HW_HAS_BACKLIGHT=1
+        ui_ok "Backlight device found"
+        log_hw "Backlight: yes"
+    fi
+
+    # Network adapters
+    ui_step "Detecting network interfaces"
+    HW_NET_ADAPTERS=$(ip link show 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{print $2}' | grep -v '^lo$' | tr '\n' ' ')
+    log_hw "Network adapters: ${HW_NET_ADAPTERS}"
+    ui_ok "Network interfaces: ${HW_NET_ADAPTERS:-none visible}"
+
+    # Wireless detection
+    if command -v iw >/dev/null 2>&1; then
+        if iw dev 2>/dev/null | grep -q 'Interface'; then
+            HW_HAS_WIRELESS=1
+            ui_ok "Wireless interface detected"
+            log_hw "Wireless: yes"
+        fi
+    elif ls /sys/class/net/ 2>/dev/null | grep -qE '^(wl|wlan)'; then
+        HW_HAS_WIRELESS=1
+        ui_ok "Wireless interface found via sysfs"
+        log_hw "Wireless: yes (sysfs)"
+    fi
+
+    # Monitor/display output check
+    ui_step "Checking display outputs"
+    if ls /sys/class/drm/ 2>/dev/null | grep -qE 'card[0-9]+-'; then
+        typeset outputs
+        outputs=$(ls /sys/class/drm/ 2>/dev/null | grep -E 'card[0-9]+-' | tr '\n' ' ')
+        log_hw "Display outputs: ${outputs}"
+        ui_ok "Display outputs: ${outputs}"
+    else
+        ui_info "Display outputs not yet visible in sysfs (normal pre-X)"
+    fi
+
+    # Storage controller (informational only)
+    ui_step "Noting storage controllers (informational)"
+    if command -v lspci >/dev/null 2>&1; then
+        typeset storage
+        storage=$(lspci 2>/dev/null | grep -i 'SATA\|NVMe\|AHCI\|RAID\|storage' | head -3 || true)
+        log_hw "Storage: ${storage}"
+        ui_info "Storage: ${storage:-not enumerated}"
+    fi
+
+    log_info "Hardware discovery complete. Intel GPU=${HW_IS_INTEL_GPU} Laptop=${HW_IS_LAPTOP} Audio=${HW_HAS_AUDIO}"
+    chk_mark "02_hardware"
+    ui_ok "Hardware discovery complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 12 — PACKAGE INSTALLATION
+# ---------------------------------------------------------------------------
+
+# Build the full package list based on hardware findings.
+build_package_list() {
+    # We'll populate this array.
+    typeset -a PKGS
+
+    # --- Core X11 ---
+    PKGS=(
+        xorg-server
+        xorg-xinit
+        xorg-xdm
+        xorg-xrandr
+        xorg-xset
+        xorg-xsetroot
+        xorg-xauth
+        xorg-xinput
+        xorg-xprop
+        xorg-xdpyinfo
+        xf86-input-libinput
+    )
+
+    # Laptop-specific X extras
+    if [ "${HW_IS_LAPTOP}" -eq 1 ]; then
+        PKGS=( "${PKGS[@]}" xorg-xbacklight )
+    fi
+
+    # --- Intel GPU packages ---
+    if [ "${HW_IS_INTEL_GPU}" -eq 1 ]; then
+        PKGS=( "${PKGS[@]}"
+            mesa
+            intel-media-driver
+            vulkan-intel
+            libva-utils
+        )
+        # Only install xf86-video-intel DDX if recommended for this hardware
+        if [ "${HW_GPU_DRIVER_RECOMMENDED}" = "intel" ]; then
+            PKGS=( "${PKGS[@]}" xf86-video-intel )
+        fi
+        PKG_INTEL_GPU_AVAILABLE=1
+    else
+        # Non-Intel: install generic mesa for whatever GPU is present
+        PKGS=( "${PKGS[@]}" mesa )
+        ui_warn "Intel GPU packages skipped — non-Intel hardware."
+    fi
+
+    # --- Fonts ---
+    PKGS=( "${PKGS[@]}"
+        ttf-dejavu
+        ttf-liberation
+        noto-fonts
+        noto-fonts-emoji
+        xorg-fonts-misc
+    )
+
+    # --- Window manager and compositor utilities ---
+    PKGS=( "${PKGS[@]}"
+        fluxbox
+        feh
+        dunst
+        picom
+    )
+
+    # --- Terminal ---
+    PKGS=( "${PKGS[@]}"
+        xterm
+    )
+
+    # --- Audio ---
+    PKGS=( "${PKGS[@]}"
+        alsa-utils
+        pipewire
+        pipewire-alsa
+        pipewire-pulse
+        wireplumber
+        pavucontrol
+    )
+
+    # --- Multimedia ---
+    PKGS=( "${PKGS[@]}"
+        mpv
+        ffmpeg
+        sxiv
+        zathura
+        zathura-pdf-mupdf
+        scrot
+    )
+
+    # --- Development ---
+    PKGS=( "${PKGS[@]}"
+        base-devel
+        git
+        openssh
+        vim
+        nano
+        curl
+        wget
+        unzip
+        zip
+        rsync
+        lsof
+        strace
+        net-tools
+        inetutils
+        bind
+    )
+
+    # --- Monitoring ---
+    PKGS=( "${PKGS[@]}"
+        htop
+        lm_sensors
+        iotop
+        lshw
+        pciutils
+        usbutils
+        dmidecode
+    )
+
+    # --- Office ---
+    PKGS=( "${PKGS[@]}"
+        libreoffice-fresh
+    )
+
+    # --- Browser ---
+    PKGS=( "${PKGS[@]}"
+        firefox
+    )
+
+    # --- Commodity / daily-driver ---
+    PKGS=( "${PKGS[@]}"
+        pcmanfm
+        xclip
+        galculator
+        network-manager-applet
+    )
+
+    # --- Network management ---
+    PKGS=( "${PKGS[@]}"
+        networkmanager
+    )
+    # Artix OpenRC service package for NetworkManager
+    if pkg_available networkmanager-openrc; then
+        PKGS=( "${PKGS[@]}" networkmanager-openrc )
+    fi
+
+    # --- System/session ---
+    if pkg_available elogind; then
+        PKGS=( "${PKGS[@]}" elogind )
+        if pkg_available elogind-openrc; then
+            PKGS=( "${PKGS[@]}" elogind-openrc )
+        fi
+    fi
+    if pkg_available acpid; then
+        PKGS=( "${PKGS[@]}" acpid )
+        if pkg_available acpid-openrc; then
+            PKGS=( "${PKGS[@]}" acpid-openrc )
+        fi
+    fi
+
+    # Print the list for the caller (space-separated on stdout)
+    print -- "${PKGS[@]}"
+}
+
+stage_packages() {
+    ui_stage "03" "Package Installation"
+    log_stage "PACKAGES"
+
+    ui_step "Building package list"
+    typeset pkg_list
+    pkg_list=$(build_package_list)
+    log_pkg "Package list: ${pkg_list}"
+    ui_info "Packages queued: $(print -- "${pkg_list}" | wc -w | tr -d ' ')"
+
+    # Synchronise package databases first
+    ui_step "Synchronising package databases"
+    run_cmd_quiet "pacman -Sy" pacman -Sy --noconfirm
+    if [ "${RC}" -ne 0 ]; then
+        ui_warn "Database sync returned non-zero. Continuing (may be already fresh)."
+    else
+        ui_ok "Package databases synchronised"
+    fi
+
+    # Install packages; skip already installed ones
+    ui_step "Installing packages (this may take several minutes)"
+    typeset pkg failed_pkgs="" installed_count=0 skip_count=0 fail_count=0
+
+    for pkg in ${pkg_list}; do
+        if pkg_installed "${pkg}"; then
+            log_pkg "Already installed: ${pkg}"
+            skip_count=$(( skip_count + 1 ))
+            continue
+        fi
+        run_cmd_quiet "Install ${pkg}" pacman -S --noconfirm --needed "${pkg}"
+        if [ "${RC}" -eq 0 ]; then
+            log_pkg "Installed: ${pkg}"
+            installed_count=$(( installed_count + 1 ))
+        else
+            log_warn "Failed to install: ${pkg}"
+            ui_warn "Package unavailable or failed: ${pkg}"
+            failed_pkgs="${failed_pkgs} ${pkg}"
+            fail_count=$(( fail_count + 1 ))
+        fi
+    done
+
+    ui_ok "Installed: ${installed_count} packages"
+    ui_skip "Already present: ${skip_count} packages"
+    if [ "${fail_count}" -gt 0 ]; then
+        ui_warn "Failed packages (${fail_count}): ${failed_pkgs}"
+        log_warn "Failed packages: ${failed_pkgs}"
+    fi
+
+    # Validate critical packages are present post-install
+    ui_step "Validating critical packages"
+    typeset critical_ok=1
+    for pkg in xorg-server xorg-xdm fluxbox alsa-utils pipewire networkmanager; do
+        if ! pkg_installed "${pkg}"; then
+            ui_fail "Critical package missing: ${pkg}"
+            log_error "Critical package missing after install: ${pkg}"
+            critical_ok=0
+        fi
+    done
+    if [ "${critical_ok}" -eq 0 ]; then
+        ui_fatal "One or more critical packages failed to install. Check log and network."
+        return 1
+    fi
+    ui_ok "Critical packages verified"
+
+    # Post-install keyboard layout validation (deferred from preflight if xorg wasn't installed)
+    typeset xkb_sym_dir="/usr/share/X11/xkb/symbols"
+    if [ -d "${xkb_sym_dir}" ] && [ ! -f "${xkb_sym_dir}/${KBD_LAYOUT}" ]; then
+        ui_fatal "XKB layout '${KBD_LAYOUT}' not found in ${xkb_sym_dir} after xorg install."
+        return 1
+    fi
+    ui_ok "XKB layout confirmed post-install"
+
+    chk_mark "03_packages"
+    ui_ok "Package installation complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 13 — SERVICE CONFIGURATION (OpenRC)
+# ---------------------------------------------------------------------------
+
+stage_services() {
+    ui_stage "04" "OpenRC Service Configuration"
+    log_stage "SERVICES"
+
+    # Disable any non-XDM display managers if accidentally present
+    ui_step "Checking for conflicting display managers"
+    typeset dm
+    for dm in lightdm sddm gdm lxdm slim; do
+        if svc_exists "${dm}"; then
+            svc_disable "${dm}" default
+            ui_warn "Disabled conflicting DM: ${dm}"
+            log_svc "Disabled conflicting DM: ${dm}"
+        fi
+    done
+
+    # XDM — enable on default runlevel
+    ui_step "Configuring XDM service"
+    if svc_exists xdm; then
+        svc_enable xdm default
+    else
+        ui_warn "XDM init script not found at /etc/init.d/xdm"
+        log_warn "XDM init script missing — package install may have placed it elsewhere"
+        # Search for it
+        typeset xdm_script
+        xdm_script=$(find /etc/init.d -name 'xdm' -o -name 'xorg-xdm' 2>/dev/null | head -1)
+        if [ -n "${xdm_script}" ]; then
+            typeset xdm_name
+            xdm_name=$(basename "${xdm_script}")
+            svc_enable "${xdm_name}" default
+        else
+            ui_fail "Cannot locate XDM init script. XDM will not start on boot."
+            log_error "XDM init script not found anywhere in /etc/init.d"
+        fi
+    fi
+
+    # NetworkManager
+    ui_step "Configuring NetworkManager service"
+    if svc_exists NetworkManager; then
+        svc_enable NetworkManager default
+    elif svc_exists networkmanager; then
+        svc_enable networkmanager default
+    else
+        ui_warn "NetworkManager service not found. Network may require manual setup."
+    fi
+
+    # elogind (required by many desktop apps for session management)
+    ui_step "Configuring elogind service"
+    if svc_exists elogind; then
+        svc_enable elogind boot
+    else
+        ui_info "elogind service not found (optional for basic Fluxbox)"
+    fi
+
+    # acpid (power/lid events; important for laptops)
+    ui_step "Configuring acpid service"
+    if svc_exists acpid; then
+        svc_enable acpid default
+        ui_ok "acpid enabled"
+    else
+        ui_info "acpid service not found (optional)"
+    fi
+
+    # ALSA sound (ensures mixer state is saved/restored at boot)
+    ui_step "Configuring ALSA sound service"
+    if svc_exists alsasound; then
+        svc_enable alsasound boot
+    else
+        ui_info "alsasound service not found (ALSA state save optional)"
+    fi
+
+    # dbus (required for NetworkManager applet, pulseaudio-pipewire bridge, etc.)
+    ui_step "Configuring D-Bus service"
+    if svc_exists dbus; then
+        svc_enable dbus default
+    else
+        ui_warn "dbus service not found. Desktop apps may misbehave."
+    fi
+
+    # Note: PipeWire runs as a user service, started from ~/.fluxbox/startup
+    ui_info "PipeWire will be started as a user session process from Fluxbox startup"
+    log_svc "PipeWire: user-session, started via ~/.fluxbox/startup"
+
+    chk_mark "04_services"
+    ui_ok "Service configuration complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 14 — GRAPHICS / X11 SETUP
+# ---------------------------------------------------------------------------
+
+stage_graphics() {
+    ui_stage "05" "Graphics and X11 Configuration"
+    log_stage "GRAPHICS"
+
+    typeset xorg_conf_d="/etc/X11/xorg.conf.d"
+    ensure_dir "${xorg_conf_d}" "root:root" "755"
+
+    # --- Keyboard configuration for X (xorg.conf.d) ---
+    ui_step "Writing X11 keyboard configuration"
+    typeset kbd_conf="${xorg_conf_d}/00-keyboard.conf"
+    backup_file "${kbd_conf}"
+
+    typeset variant_line="" options_line=""
+    if [ -n "${KBD_VARIANT}" ]; then
+        variant_line="    Option \"XkbVariant\" \"${KBD_VARIANT}\""
+    fi
+    if [ -n "${KBD_OPTIONS}" ]; then
+        options_line="    Option \"XkbOptions\" \"${KBD_OPTIONS}\""
+    fi
+
+    write_file "${kbd_conf}" "root:root" "644" <<KBDCONF
+# X11 keyboard configuration — managed by ${SCRIPT_NAME}
+Section "InputClass"
+    Identifier    "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout"  "${KBD_LAYOUT}"
+    Option "XkbModel"   "${KBD_MODEL}"
+${variant_line}
+${options_line}
+EndSection
+KBDCONF
+    ui_ok "Keyboard xorg config: ${kbd_conf}"
+    log_file "Wrote ${kbd_conf}"
+
+    # --- Intel GPU xorg configuration ---
+    if [ "${HW_IS_INTEL_GPU}" -eq 1 ]; then
+        ui_step "Writing Intel GPU X11 configuration"
+        typeset gpu_conf="${xorg_conf_d}/20-intel.conf"
+        backup_file "${gpu_conf}"
+
+        if [ "${HW_GPU_DRIVER_RECOMMENDED}" = "modesetting" ]; then
+            write_file "${gpu_conf}" "root:root" "644" <<GPUCONF
+# Intel GPU — modesetting DDX
+# Managed by ${SCRIPT_NAME}
+Section "Device"
+    Identifier  "Intel"
+    Driver      "modesetting"
+    Option      "AccelMethod" "glamor"
+    Option      "DRI"         "3"
+EndSection
+GPUCONF
+            ui_ok "Intel GPU: modesetting driver configured"
+        else
+            write_file "${gpu_conf}" "root:root" "644" <<GPUCONF
+# Intel GPU — xf86-video-intel DDX
+# Managed by ${SCRIPT_NAME}
+Section "Device"
+    Identifier  "Intel"
+    Driver      "intel"
+    Option      "AccelMethod" "sna"
+    Option      "DRI"         "3"
+    Option      "TearFree"    "true"
+EndSection
+GPUCONF
+            ui_ok "Intel GPU: intel DDX (SNA+TearFree) configured"
+        fi
+        log_file "Wrote ${gpu_conf}"
+    else
+        ui_info "Skipping Intel GPU xorg config (non-Intel hardware)"
+    fi
+
+    # --- libinput touchpad configuration (laptop) ---
+    if [ "${HW_IS_LAPTOP}" -eq 1 ]; then
+        ui_step "Writing libinput touchpad configuration"
+        typeset tp_conf="${xorg_conf_d}/30-touchpad.conf"
+        backup_file "${tp_conf}"
+        write_file "${tp_conf}" "root:root" "644" <<TPCONF
+# Touchpad configuration — managed by ${SCRIPT_NAME}
+Section "InputClass"
+    Identifier  "touchpad"
+    Driver      "libinput"
+    MatchIsTouchpad "on"
+    Option      "Tapping"          "on"
+    Option      "TappingButtonMap" "lrm"
+    Option      "NaturalScrolling" "false"
+    Option      "DisableWhileTyping" "on"
+EndSection
+TPCONF
+        ui_ok "Touchpad configuration written"
+        log_file "Wrote ${tp_conf}"
+    fi
+
+    # --- Console keyboard (OpenRC /etc/conf.d/keymaps) ---
+    ui_step "Configuring console keyboard layout"
+    typeset keymaps_conf="/etc/conf.d/keymaps"
+    if [ -f "${keymaps_conf}" ]; then
+        backup_file "${keymaps_conf}"
+    fi
+    write_file "${keymaps_conf}" "root:root" "644" <<KEYMAPS
+# Console keymap — managed by ${SCRIPT_NAME}
+keymap="${KBD_LAYOUT}"
+KEYMAPS
+    ui_ok "Console keymap set to: ${KBD_LAYOUT}"
+    log_file "Wrote ${keymaps_conf}"
+
+    chk_mark "05_graphics"
+    ui_ok "Graphics and X11 configuration complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 15 — XDM SETUP
+# ---------------------------------------------------------------------------
+
+stage_xdm() {
+    ui_stage "06" "XDM Display Manager Configuration"
+    log_stage "XDM"
+
+    typeset xdm_dir="/etc/X11/xdm"
+    typeset xdm_vardir="/var/lib/xdm"
+
+    ensure_dir "${xdm_dir}" "root:root" "755"
+    ensure_dir "${xdm_vardir}" "root:root" "755"
+
+    # --- xdm-config ---
+    ui_step "Writing XDM configuration"
+    typeset xdm_config="${xdm_dir}/xdm-config"
+    backup_file "${xdm_config}"
+
+    write_file "${xdm_config}" "root:root" "644" <<XDMCFG
+! XDM configuration — managed by ${SCRIPT_NAME}
+DisplayManager.authDir:                 /var/lib/xdm
+DisplayManager.errorLogFile:            /var/log/xdm-error.log
+DisplayManager.pidFile:                 /var/run/xdm.pid
+DisplayManager.keyFile:                 /var/lib/xdm/xdm-keys
+DisplayManager.servers:                 /etc/X11/xdm/Xservers
+DisplayManager.accessFile:              /etc/X11/xdm/Xaccess
+DisplayManager*resources:               /etc/X11/xdm/Xresources
+DisplayManager*session:                 /etc/X11/xdm/Xsession
+DisplayManager*login.Login.width:       250
+DisplayManager*login.Login.height:      200
+DisplayManager*login.Login.x:           524
+DisplayManager*login.Login.y:           384
+DisplayManager._0.authorize:            true
+DisplayManager*authorize:               false
+XDMCFG
+    ui_ok "xdm-config written"
+
+    # --- Xservers ---
+    ui_step "Writing Xservers file"
+    write_file "${xdm_dir}/Xservers" "root:root" "644" <<XSERVERS
+# Xservers — managed by ${SCRIPT_NAME}
+:0 local /usr/bin/X :0 vt7 -nolisten tcp
+XSERVERS
+    ui_ok "Xservers configured"
+
+    # --- Xaccess ---
+    ui_step "Writing Xaccess file"
+    write_file "${xdm_dir}/Xaccess" "root:root" "644" <<XACCESS
+# Xaccess — managed by ${SCRIPT_NAME}
+# Only local displays (no XDMCP)
+XACCESS
+    ui_ok "Xaccess configured (local only)"
+
+    # --- Xresources (XDM login appearance) ---
+    ui_step "Writing XDM Xresources (login screen appearance)"
+    write_file "${xdm_dir}/Xresources" "root:root" "644" <<XRES
+! XDM login screen resources — managed by ${SCRIPT_NAME}
+xlogin*login.translations: #override\
+    <Key>Return:    set-session-argument() finish-field()\n\
+    Ctrl<Key>Return: set-session-argument(failsafe) finish-field()
+
+xlogin*borderWidth:       1
+xlogin*greeting:          Artix Linux — Fluxbox Desktop
+xlogin*namePrompt:        Login:\040
+xlogin*passwdPrompt:      Password:\040
+
+xlogin*background:        #1a1a2e
+xlogin*foreground:        #c8ccd4
+xlogin*borderColor:       #4a4e69
+xlogin*font:              -misc-fixed-medium-r-normal--15-*-*-*-*-*-*-*
+
+xlogin*greetFont:         -misc-fixed-bold-r-normal--18-*-*-*-*-*-*-*
+xlogin*greetColor:        #7eb6ff
+
+xlogin*promptFont:        -misc-fixed-medium-r-normal--13-*-*-*-*-*-*-*
+xlogin*promptColor:       #adb5bd
+
+xlogin*inputFont:         -misc-fixed-medium-r-normal--13-*-*-*-*-*-*-*
+xlogin*inputColor:        #e8eaf0
+
+xlogin*frameWidth:        2
+xlogin*innerFramesWidth:  2
+XRES
+    ui_ok "XDM Xresources written"
+
+    # --- Xsession (main session dispatch script) ---
+    ui_step "Writing XDM Xsession script"
+    write_file "${xdm_dir}/Xsession" "root:root" "755" <<'XSESS'
+#!/bin/sh
+# XDM Xsession — managed by artix-fluxbox-setup.ksh
+# Dispatches to user's ~/.xsession if present and executable.
+
+# Safety: ensure PATH is sane
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+export PATH
+
+# Source system profile
+if [ -f /etc/profile ]; then
+    . /etc/profile
+fi
+
+# Source user profile if it exists
+if [ -f "${HOME}/.profile" ]; then
+    . "${HOME}/.profile"
+fi
+
+# Run user's xsession if executable
+if [ -x "${HOME}/.xsession" ]; then
+    exec "${HOME}/.xsession"
+fi
+
+# Fallback: run .xinitrc if executable
+if [ -x "${HOME}/.xinitrc" ]; then
+    exec "${HOME}/.xinitrc"
+fi
+
+# Hard fallback: launch Fluxbox directly
+exec /usr/bin/fluxbox
+XSESS
+    ui_ok "XDM Xsession script written"
+
+    # --- Xsetup_0 (runs as root before the login dialog; set background) ---
+    ui_step "Writing Xsetup_0 script"
+    write_file "${xdm_dir}/Xsetup_0" "root:root" "755" <<'XSETUP'
+#!/bin/sh
+# XDM Xsetup_0 — runs as root before login dialog appears
+# Set a plain background colour for the login screen.
+xsetroot -solid '#1a1a2e' 2>/dev/null || true
+XSETUP
+    ui_ok "Xsetup_0 written"
+
+    log_info "XDM configuration complete in ${xdm_dir}"
+    chk_mark "06_xdm"
+    ui_ok "XDM configuration complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 16 — FLUXBOX SETUP (user environment)
+# ---------------------------------------------------------------------------
+
+# Write a file owned by the target user.
+write_user_file() {
+    typeset path="$1" mode="$2"
+    typeset tmp="${path}.tmp.$$"
+    cat > "${tmp}"
+    chown "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${tmp}"
+    chmod "${mode}" "${tmp}"
+    mv -f "${tmp}" "${path}"
+    log_file "User file written: ${path} mode=${mode}"
+}
+
+stage_fluxbox() {
+    ui_stage "07" "Fluxbox Desktop Configuration"
+    log_stage "FLUXBOX"
+
+    typeset fb_dir="${TARGET_HOME}/.fluxbox"
+    typeset xsession_path="${TARGET_HOME}/.xsession"
+
+    ensure_dir "${fb_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "700"
+
+    # --- ~/.xsession (XDM session entry point) ---
+    ui_step "Writing user ~/.xsession"
+    backup_file "${xsession_path}"
+
+    typeset variant_arg=""
+    if [ -n "${KBD_VARIANT}" ]; then
+        variant_arg="-variant ${KBD_VARIANT}"
+    fi
+    typeset options_arg=""
+    if [ -n "${KBD_OPTIONS}" ]; then
+        options_arg="-option '${KBD_OPTIONS}'"
+    fi
+
+    write_user_file "${xsession_path}" "755" <<XSESS
+#!/bin/sh
+# ${TARGET_USER} XDM session — managed by ${SCRIPT_NAME}
+
+# Set keyboard layout
+setxkbmap -layout "${KBD_LAYOUT}" -model "${KBD_MODEL}" ${variant_arg} ${options_arg} 2>/dev/null || true
+
+# Disable screen blanking and DPMS during session
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+
+# Set DPI for font rendering
+xrandr --dpi 96 2>/dev/null || true
+
+# Start D-Bus session if not already running
+if [ -z "\${DBUS_SESSION_BUS_ADDRESS}" ]; then
+    eval \$(dbus-launch --sh-syntax --exit-with-session) 2>/dev/null || true
+fi
+
+# Start PipeWire audio (user session)
+pipewire &
+sleep 0.5
+wireplumber &
+pipewire-pulse &
+
+# Start dunst notification daemon
+dunst -config "\${HOME}/.config/dunst/dunstrc" &
+
+# Start NetworkManager applet if NM is running
+nm-applet 2>/dev/null &
+
+# Set background colour (feh will override if wallpaper exists)
+xsetroot -solid '#1a1a2e'
+
+# Start Fluxbox
+exec fluxbox
+XSESS
+    ui_ok "~/.xsession written and executable"
+
+    # --- ~/.fluxbox/startup ---
+    ui_step "Writing ~/.fluxbox/startup"
+    write_user_file "${fb_dir}/startup" "755" <<'FBSTART'
+#!/bin/sh
+# Fluxbox startup script — managed by artix-fluxbox-setup.ksh
+# This file is sourced by Fluxbox at session start.
+# Add per-session startup commands here.
+
+# Optionally set background via feh if a wallpaper image exists
+if [ -f "${HOME}/.fluxbox/background.png" ]; then
+    feh --bg-scale "${HOME}/.fluxbox/background.png" &
+elif [ -f "${HOME}/.fluxbox/background.jpg" ]; then
+    feh --bg-scale "${HOME}/.fluxbox/background.jpg" &
+fi
+
+exec fluxbox
+FBSTART
+    ui_ok "~/.fluxbox/startup written"
+
+    # --- ~/.fluxbox/init ---
+    ui_step "Writing ~/.fluxbox/init (main settings)"
+    write_user_file "${fb_dir}/init" "644" <<FBINIT
+session.screen0.workspaces: 4
+session.screen0.workspaceNames: Main,Work,Media,Dev
+session.screen0.toolbar.visible: true
+session.screen0.toolbar.placement: BottomCenter
+session.screen0.toolbar.widthPercent: 100
+session.screen0.toolbar.alpha: 255
+session.screen0.toolbar.autoHide: false
+session.screen0.toolbar.maxOver: false
+session.screen0.toolbar.onhead: 0
+session.screen0.toolbar.layer: Dock
+session.screen0.toolbar.tools: prevworkspace, workspacename, nextworkspace, iconbar, systemtray, clock
+session.screen0.iconbar.mode: {static groups} (workspace=[current])
+session.screen0.iconbar.usePixmap: true
+session.screen0.focusModel: ClickFocus
+session.screen0.windowPlacement: RowSmartPlacement
+session.screen0.colPlacementDirection: TopToBottom
+session.screen0.rowPlacementDirection: LeftToRight
+session.screen0.edgeSnapThreshold: 10
+session.screen0.clickRaises: true
+session.screen0.tabs.maxWidth: 200
+session.screen0.tabs.usePixmap: true
+session.screen0.antialias: true
+session.screen0.imageControl: cache
+session.screen0.styleFile: /usr/share/fluxbox/styles/bloe
+session.menuFile: ${TARGET_HOME}/.fluxbox/menu
+session.keyFile: ${TARGET_HOME}/.fluxbox/keys
+session.appsFile: ${TARGET_HOME}/.fluxbox/apps
+session.slitlistFile: ${TARGET_HOME}/.fluxbox/slitlist
+session.groupFile: ${TARGET_HOME}/.fluxbox/groups
+session.cacheLife: 5
+session.cacheMax: 200
+session.colorsPerChannel: 4
+session.doubleClickInterval: 250
+session.tabPadding: 0
+session.forcePseudoTransparency: false
+session.ignoreBorder: false
+session.autoRaiseDelay: 250
+FBINIT
+    ui_ok "~/.fluxbox/init written"
+
+    # --- ~/.fluxbox/keys (keybindings) ---
+    ui_step "Writing ~/.fluxbox/keys (keybindings)"
+    write_user_file "${fb_dir}/keys" "644" <<'FBKEYS'
+# Fluxbox key bindings — managed by artix-fluxbox-setup.ksh
+
+# Mouse bindings
+OnDesktop Mouse1 :HideMenus
+OnDesktop Mouse2 :WorkspaceMenu
+OnDesktop Mouse3 :RootMenu
+OnDesktop Mouse4 :NextWorkspace
+OnDesktop Mouse5 :PrevWorkspace
+
+OnToolbar Mouse4 :NextWorkspace
+OnToolbar Mouse5 :PrevWorkspace
+
+OnWindow Mod1 Mouse1 :StartMoving
+OnWindow Mod1 Mouse3 :StartResizing NearestCorner
+OnWindow Mouse2 :StartMoving
+
+# Workspace switching (keyboard)
+Mod4 1  :Workspace 1
+Mod4 2  :Workspace 2
+Mod4 3  :Workspace 3
+Mod4 4  :Workspace 4
+
+Mod4 Left   :PrevWorkspace
+Mod4 Right  :NextWorkspace
+
+# Move window to workspace
+Mod4 Shift 1  :SendToWorkspace 1
+Mod4 Shift 2  :SendToWorkspace 2
+Mod4 Shift 3  :SendToWorkspace 3
+Mod4 Shift 4  :SendToWorkspace 4
+
+# Window management
+Mod4 F4         :Close
+Mod4 F5         :Kill
+Mod4 m          :Minimize
+Mod4 Shift m    :MinimizeWindow
+Mod4 x          :Maximize
+Mod4 f          :Fullscreen
+Mod4 Up         :MaximizeVertical
+Mod4 Down       :Restore
+Mod4 Tab        :NextWindow
+Mod4 Shift Tab  :PrevWindow
+Mod4 d          :ShowDesktop
+Mod4 r          :RaiseFocus
+
+# Application launchers
+Mod4 t          :Exec xterm
+Mod4 e          :Exec pcmanfm
+Mod4 b          :Exec firefox
+Mod4 Return     :Exec xterm
+
+# Screenshot
+Print           :Exec scrot '%Y-%m-%d_%H%M%S.png' -e 'mv $f ~/Pictures/'
+Mod1 Print      :Exec scrot -s '%Y-%m-%d_%H%M%S_select.png' -e 'mv $f ~/Pictures/'
+
+# Volume control (ALSA/PipeWire via amixer)
+XF86AudioRaiseVolume    :Exec amixer set Master 5%+
+XF86AudioLowerVolume    :Exec amixer set Master 5%-
+XF86AudioMute           :Exec amixer set Master toggle
+
+# Laptop backlight
+XF86MonBrightnessUp     :Exec xbacklight -inc 10
+XF86MonBrightnessDown   :Exec xbacklight -dec 10
+
+# Lock screen (basic xlock if available, else blank)
+Mod4 l          :Exec xset s activate
+
+# Reload Fluxbox config
+Mod4 Shift r    :Reconfigure
+
+# Open Fluxbox menu
+Mod4 space      :RootMenu
+FBKEYS
+    ui_ok "~/.fluxbox/keys written"
+
+    # --- ~/.fluxbox/menu ---
+    ui_step "Writing ~/.fluxbox/menu"
+    # Build menu based on installed packages
+    write_user_file "${fb_dir}/menu" "644" <<FBMENU
+[begin] (Artix Fluxbox)
+    [submenu] (Terminal)
+        [exec] (XTerm)     {xterm}
+    [end]
+    [submenu] (Internet)
+        [exec] (Firefox)           {firefox}
+        [exec] (Network Manager)   {nm-connection-editor}
+    [end]
+    [submenu] (Files)
+        [exec] (PCManFM)           {pcmanfm}
+    [end]
+    [submenu] (Multimedia)
+        [exec] (MPV Player)        {mpv}
+        [exec] (Image Viewer)      {sxiv}
+        [exec] (PDF Reader)        {zathura}
+        [exec] (Volume Control)    {pavucontrol}
+        [exec] (Screenshot)        {scrot '%Y%m%d_%H%M%S.png' -e 'mv \$f ~/Pictures/'}
+    [end]
+    [submenu] (Office)
+        [exec] (LibreOffice Writer)      {libreoffice --writer}
+        [exec] (LibreOffice Calc)        {libreoffice --calc}
+        [exec] (LibreOffice Impress)     {libreoffice --impress}
+        [exec] (LibreOffice Draw)        {libreoffice --draw}
+    [end]
+    [submenu] (Development)
+        [exec] (Vim)               {xterm -e vim}
+        [exec] (Nano)              {xterm -e nano}
+        [exec] (Git Log)           {xterm -e "git log --oneline -20; read _"}
+    [end]
+    [submenu] (System)
+        [exec] (HTop)              {xterm -e htop}
+        [exec] (LM Sensors)        {xterm -e "sensors; read _"}
+        [exec] (Disk Usage)        {xterm -e "df -h; read _"}
+        [exec] (Calculator)        {galculator}
+        [exec] (Fluxbox Settings)  {fluxbox-remote reconfigure}
+    [end]
+    [submenu] (Workspaces) {}
+        [workspaces] (Workspaces)
+    [end]
+    [config] (Configure Fluxbox)
+    [reconfig] (Reload Config)
+    [restart] (Restart Fluxbox)
+    [separator]
+    [exec] (Lock Screen) {xset s activate}
+    [exit] (Log Out)
+[end]
+FBMENU
+    ui_ok "~/.fluxbox/menu written"
+
+    # --- ~/.fluxbox/apps (per-application window placement hints) ---
+    ui_step "Writing ~/.fluxbox/apps"
+    write_user_file "${fb_dir}/apps" "644" <<'FBAPPS'
+# Fluxbox application placement rules — managed by artix-fluxbox-setup.ksh
+
+[app] (xterm)
+  [Dimensions]    {100 30}
+  [Position]      (WINCENTER) {0 0}
+  [Layer]         {6}
+[end]
+
+[app] (firefox)
+  [Workspace]     {1}
+  [Dimensions]    {1200 800}
+  [Position]      (WINCENTER) {0 0}
+[end]
+
+[app] (libreoffice)
+  [Workspace]     {2}
+  [Dimensions]    {1200 850}
+  [Position]      (WINCENTER) {0 0}
+[end]
+
+[app] (pcmanfm)
+  [Dimensions]    {900 600}
+  [Position]      (WINCENTER) {0 0}
+[end]
+
+[app] (pavucontrol)
+  [Dimensions]    {700 450}
+  [Position]      (WINCENTER) {0 0}
+  [Layer]         {4}
+[end]
+FBAPPS
+    ui_ok "~/.fluxbox/apps written"
+
+    # --- ~/.fluxbox/overlay (style override for clean rendering) ---
+    ui_step "Writing ~/.fluxbox/overlay (style overrides)"
+    write_user_file "${fb_dir}/overlay" "644" <<'FBOVER'
+! Fluxbox style overlay — managed by artix-fluxbox-setup.ksh
+! Override selected style properties for readability.
+
+toolbar.height: 22
+toolbar.alpha: 230
+
+menu.titleHeight: 20
+menu.itemHeight: 18
+menu.alpha: 240
+
+window.title.height: 20
+FBOVER
+    ui_ok "~/.fluxbox/overlay written"
+
+    # Ensure Pictures directory exists for screenshots
+    ensure_dir "${TARGET_HOME}/Pictures" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+
+    # Fix ownership of everything under .fluxbox
+    ui_step "Setting correct ownership on ~/.fluxbox"
+    chown -R "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${fb_dir}"
+    ui_ok "Ownership corrected"
+
+    chk_mark "07_fluxbox"
+    ui_ok "Fluxbox configuration complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 17 — AUDIO SETUP
+# ---------------------------------------------------------------------------
+
+stage_audio() {
+    ui_stage "08" "Audio Configuration"
+    log_stage "AUDIO"
+
+    if [ "${HW_HAS_AUDIO}" -eq 0 ]; then
+        ui_warn "No audio hardware detected. Skipping audio configuration."
+        log_warn "Audio setup skipped: no hardware"
+        chk_mark "08_audio"
+        return 0
+    fi
+
+    # ALSA: unmute Master and PCM channels to sane default
+    ui_step "Setting ALSA mixer defaults"
+    if command -v amixer >/dev/null 2>&1; then
+        run_cmd_quiet "ALSA unmute Master" amixer sset Master unmute 2>/dev/null || true
+        run_cmd_quiet "ALSA set Master 80%" amixer sset Master 80% 2>/dev/null || true
+        run_cmd_quiet "ALSA unmute PCM" amixer sset PCM unmute 2>/dev/null || true
+        run_cmd_quiet "ALSA set PCM 80%" amixer sset PCM 80% 2>/dev/null || true
+        ui_ok "ALSA mixer: Master and PCM set to 80%, unmuted"
+        log_info "ALSA mixer defaults applied"
+
+        # Save ALSA state
+        if command -v alsactl >/dev/null 2>&1; then
+            run_cmd_quiet "alsactl store" alsactl store 2>/dev/null || true
+            ui_ok "ALSA state saved"
+        fi
+    else
+        ui_warn "amixer not found; ALSA mixer not configured"
+    fi
+
+    # PipeWire: ensure user config directory exists
+    ui_step "Preparing PipeWire user configuration"
+    typeset pw_conf_dir="${TARGET_HOME}/.config/pipewire"
+    ensure_dir "${pw_conf_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+
+    # PipeWire default rate config for Intel HDA (common Intel audio)
+    write_user_file "${pw_conf_dir}/pipewire.conf.d/10-artix.conf" "644" <<'PWCONF'
+# PipeWire default configuration — managed by artix-fluxbox-setup.ksh
+context.properties = {
+    default.clock.rate          = 48000
+    default.clock.quantum       = 1024
+    default.clock.min-quantum   = 32
+    default.clock.max-quantum   = 8192
+}
+PWCONF
+    chown -R "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${TARGET_HOME}/.config/pipewire"
+    ui_ok "PipeWire user config prepared"
+
+    # WirePlumber user config directory
+    typeset wp_conf_dir="${TARGET_HOME}/.config/wireplumber"
+    ensure_dir "${wp_conf_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+    chown -R "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${wp_conf_dir}"
+    ui_ok "WirePlumber user config directory ready"
+
+    # Validate audio readiness: check that ALSA sees at least one card
+    ui_step "Validating audio readiness"
+    if [ -d /proc/asound ] && ls /proc/asound/card* >/dev/null 2>&1; then
+        typeset card_list
+        card_list=$(ls /proc/asound/ | grep '^card' | tr '\n' ' ')
+        ui_ok "ALSA cards visible: ${card_list}"
+        log_info "ALSA cards: ${card_list}"
+        PKG_AUDIO_AVAILABLE=1
+    else
+        ui_warn "No ALSA cards visible in /proc/asound. Audio may require reboot."
+        log_warn "No ALSA cards visible"
+    fi
+
+    chk_mark "08_audio"
+    ui_ok "Audio configuration complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 18 — KEYBOARD (console + X11 persistence)
+# ---------------------------------------------------------------------------
+
+stage_keyboard() {
+    ui_stage "09" "Keyboard Layout Persistence"
+    log_stage "KEYBOARD"
+
+    # Console keymap was already written in stage_graphics.
+    # Here we ensure the keymaps service is correctly positioned,
+    # and confirm X11 configuration is complete.
+
+    ui_step "Verifying /etc/conf.d/keymaps"
+    if grep -q "keymap=\"${KBD_LAYOUT}\"" /etc/conf.d/keymaps 2>/dev/null; then
+        ui_ok "Console keymap '${KBD_LAYOUT}' confirmed in /etc/conf.d/keymaps"
+    else
+        ui_warn "Console keymap not found in /etc/conf.d/keymaps — rewriting"
+        write_file "/etc/conf.d/keymaps" "root:root" "644" <<KEYMAPS
+# Console keymap — managed by ${SCRIPT_NAME}
+keymap="${KBD_LAYOUT}"
+KEYMAPS
+        ui_ok "Console keymap corrected"
+    fi
+
+    ui_step "Verifying /etc/X11/xorg.conf.d/00-keyboard.conf"
+    if [ -f /etc/X11/xorg.conf.d/00-keyboard.conf ]; then
+        if grep -q "\"${KBD_LAYOUT}\"" /etc/X11/xorg.conf.d/00-keyboard.conf 2>/dev/null; then
+            ui_ok "X11 keyboard config confirmed"
+        else
+            ui_warn "X11 keyboard config mismatch — re-running graphics stage"
+            stage_graphics
+        fi
+    else
+        ui_warn "X11 keyboard config missing — re-running graphics stage"
+        stage_graphics
+    fi
+
+    # Apply keyboard layout to current TTY session if possible
+    ui_step "Applying keyboard to current TTY"
+    if command -v loadkeys >/dev/null 2>&1; then
+        run_cmd_quiet "loadkeys ${KBD_LAYOUT}" loadkeys "${KBD_LAYOUT}" 2>/dev/null || true
+        ui_ok "loadkeys applied: ${KBD_LAYOUT} (current TTY)"
+    else
+        ui_info "loadkeys not available; layout effective after next boot/login"
+    fi
+
+    log_info "Keyboard persistence: layout=${KBD_LAYOUT} variant=${KBD_VARIANT:-none}"
+    chk_mark "09_keyboard"
+    ui_ok "Keyboard persistence configured."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 19 — DESKTOP SOFTWARE CONFIGURATION
+# ---------------------------------------------------------------------------
+
+stage_desktop_config() {
+    ui_stage "10" "Desktop Software Configuration"
+    log_stage "DESKTOP_CONFIG"
+
+    typeset user_conf_dir="${TARGET_HOME}/.config"
+    ensure_dir "${user_conf_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+
+    # --- dunst notification configuration ---
+    ui_step "Configuring dunst notifications"
+    typeset dunst_dir="${user_conf_dir}/dunst"
+    ensure_dir "${dunst_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+
+    write_user_file "${dunst_dir}/dunstrc" "644" <<'DUNSTRC'
+# dunst configuration — managed by artix-fluxbox-setup.ksh
+[global]
+    monitor              = 0
+    follow               = none
+    width                = 300
+    height               = 80
+    origin               = top-right
+    offset               = 12x48
+    scale                = 0
+    notification_limit   = 5
+    progress_bar         = true
+    indicate_hidden      = yes
+    transparency         = 10
+    separator_height     = 2
+    padding              = 8
+    horizontal_padding   = 10
+    frame_width          = 1
+    frame_color          = "#4a4e69"
+    gap_size             = 3
+    idle_threshold       = 120
+    font                 = DejaVu Sans 10
+    line_height          = 0
+    markup               = full
+    format               = "<b>%s</b>\n%b"
+    alignment            = left
+    show_age_threshold   = 60
+    word_wrap            = yes
+    ignore_newline       = no
+    stack_duplicates     = true
+    hide_duplicate_count = false
+    show_indicators      = yes
+    icon_theme           = hicolor
+    enable_recursive_icon_lookup = true
+    icon_position        = left
+    min_icon_size        = 0
+    max_icon_size        = 32
+    sticky_history       = yes
+    history_length       = 20
+    browser              = /usr/bin/firefox
+    always_run_script    = true
+    title                = Dunst
+    class                = Dunst
+    corner_radius        = 4
+    timeout              = 5
+    sort                 = yes
+    mouse_left_click     = close_current
+    mouse_middle_click   = do_action, close_current
+    mouse_right_click    = close_all
+
+[urgency_low]
+    background = "#1a1a2e"
+    foreground = "#adb5bd"
+    timeout    = 5
+
+[urgency_normal]
+    background = "#1a1a2e"
+    foreground = "#c8ccd4"
+    timeout    = 7
+
+[urgency_critical]
+    background = "#7e1f1f"
+    foreground = "#ffffff"
+    frame_color = "#ff4040"
+    timeout    = 0
+DUNSTRC
+    ui_ok "dunst configuration written"
+
+    # --- XTerm defaults via ~/.Xresources ---
+    ui_step "Configuring XTerm (Xresources)"
+    typeset xres_file="${TARGET_HOME}/.Xresources"
+    backup_file "${xres_file}"
+
+    write_user_file "${xres_file}" "644" <<'XRESOURCES'
+! ~/.Xresources — managed by artix-fluxbox-setup.ksh
+
+! XTerm general settings
+XTerm*termName:           xterm-256color
+XTerm*utf8:               1
+XTerm*locale:             true
+XTerm*cursorBlink:        true
+XTerm*cursorColor:        #7eb6ff
+XTerm*scrollBar:          false
+XTerm*rightScrollBar:     false
+XTerm*saveLines:          4096
+XTerm*multiScroll:        true
+XTerm*jumpScroll:         true
+XTerm*fastScroll:         true
+XTerm*bellIsUrgent:       true
+XTerm*visualBell:         false
+
+! XTerm font
+XTerm*faceName:           DejaVu Sans Mono
+XTerm*faceSize:           11
+XTerm*renderFont:         true
+XTerm*antialias:          true
+
+! XTerm colours (dark theme)
+XTerm*background:         #1a1a2e
+XTerm*foreground:         #c8ccd4
+XTerm*cursorColor:        #7eb6ff
+XTerm*color0:             #1a1a2e
+XTerm*color1:             #e06c75
+XTerm*color2:             #98c379
+XTerm*color3:             #e5c07b
+XTerm*color4:             #61afef
+XTerm*color5:             #c678dd
+XTerm*color6:             #56b6c2
+XTerm*color7:             #abb2bf
+XTerm*color8:             #3e4452
+XTerm*color9:             #e06c75
+XTerm*color10:            #98c379
+XTerm*color11:            #e5c07b
+XTerm*color12:            #61afef
+XTerm*color13:            #c678dd
+XTerm*color14:            #56b6c2
+XTerm*color15:            #ffffff
+
+! XTerm window geometry
+XTerm*geometry:           100x30
+
+! Key bindings in XTerm
+XTerm.VT100.Translations: #override \
+    Ctrl Shift <Key>C: copy-selection(CLIPBOARD) \n\
+    Ctrl Shift <Key>V: insert-selection(CLIPBOARD)
+
+! Scrollback via Shift+PageUp/Down
+XTerm*VT100.Translations: #override \
+    Shift<Key>Prior: scroll-back(1, pages) \n\
+    Shift<Key>Next: scroll-forw(1, pages)
+XRESOURCES
+    ui_ok "~/.Xresources written"
+
+    # --- ~/.profile (environment for session) ---
+    ui_step "Configuring ~/.profile (session environment)"
+    typeset profile_file="${TARGET_HOME}/.profile"
+    backup_file "${profile_file}"
+
+    # Append env setup if not already present
+    typeset profile_marker="# artix-fluxbox-setup managed block"
+    if ! grep -qF "${profile_marker}" "${profile_file}" 2>/dev/null; then
+        cat >> "${profile_file}" <<PROFILE
+
+${profile_marker}
+export PATH="\${HOME}/.local/bin:\${PATH}"
+export EDITOR=vim
+export VISUAL=vim
+export PAGER=less
+export LESS="-R -M -i"
+export MOZ_ENABLE_WAYLAND=0
+export LANG="${LANG:-en_US.UTF-8}"
+export GTK_THEME=Adwaita:dark
+PROFILE
+        chown "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${profile_file}"
+        ui_ok "~/.profile updated with session environment"
+    else
+        ui_skip "~/.profile already contains managed block"
+    fi
+
+    # --- MPV configuration ---
+    ui_step "Configuring MPV"
+    typeset mpv_dir="${user_conf_dir}/mpv"
+    ensure_dir "${mpv_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+    write_user_file "${mpv_dir}/mpv.conf" "644" <<'MPVCONF'
+# MPV configuration — managed by artix-fluxbox-setup.ksh
+hwdec=auto-safe
+vo=gpu
+gpu-api=auto
+ao=pipewire
+audio-channels=stereo
+volume-max=150
+osc=yes
+osd-bar=yes
+save-position-on-quit=yes
+cache=yes
+MPVCONF
+    ui_ok "MPV configuration written"
+
+    # --- PCManFM: ensure user-dirs.dirs exists ---
+    ui_step "Ensuring XDG user directories"
+    typeset xdg_conf="${user_conf_dir}/user-dirs.dirs"
+    if [ ! -f "${xdg_conf}" ]; then
+        if command -v xdg-user-dirs-update >/dev/null 2>&1; then
+            run_cmd_quiet "xdg-user-dirs-update as ${TARGET_USER}" \
+                su -c "xdg-user-dirs-update" "${TARGET_USER}" 2>/dev/null || true
+        else
+            write_user_file "${xdg_conf}" "644" <<XDGDIRS
+XDG_DESKTOP_DIR="\$HOME/Desktop"
+XDG_DOWNLOAD_DIR="\$HOME/Downloads"
+XDG_TEMPLATES_DIR="\$HOME/Templates"
+XDG_PUBLICSHARE_DIR="\$HOME/Public"
+XDG_DOCUMENTS_DIR="\$HOME/Documents"
+XDG_MUSIC_DIR="\$HOME/Music"
+XDG_PICTURES_DIR="\$HOME/Pictures"
+XDG_VIDEOS_DIR="\$HOME/Videos"
+XDGDIRS
+        fi
+    fi
+
+    # Ensure XDG directories exist for the user
+    for xdg_sub in Desktop Downloads Documents Music Pictures Videos; do
+        ensure_dir "${TARGET_HOME}/${xdg_sub}" \
+            "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+    done
+    ui_ok "XDG user directories present"
+
+    # Fix all user config ownership
+    chown -R "${TARGET_USER}:$(id -gn "${TARGET_USER}")" \
+        "${user_conf_dir}" 2>/dev/null || true
+
+    chk_mark "10_desktop_config"
+    ui_ok "Desktop software configuration complete."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 20 — USER ENVIRONMENT FINALISATION
+# ---------------------------------------------------------------------------
+
+stage_user_env() {
+    ui_stage "11" "User Environment Finalisation"
+    log_stage "USER_ENV"
+
+    # Ensure ~/.local/bin exists for user scripts
+    ensure_dir "${TARGET_HOME}/.local/bin" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "755"
+    ui_ok "~/.local/bin directory present"
+
+    # Ensure ~/.ssh exists with correct permissions
+    ensure_dir "${TARGET_HOME}/.ssh" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "700"
+    ui_ok "~/.ssh directory present (700)"
+
+    # Merge Xresources on login via ~/.xinitrc (XDM uses .xsession, but keep .xinitrc as fallback)
+    typeset xinitrc="${TARGET_HOME}/.xinitrc"
+    if [ ! -f "${xinitrc}" ]; then
+        write_user_file "${xinitrc}" "755" <<'XINITRC'
+#!/bin/sh
+# ~/.xinitrc — fallback for startx; XDM uses ~/.xsession directly.
+[ -f "${HOME}/.Xresources" ] && xrdb -merge "${HOME}/.Xresources"
+exec "${HOME}/.xsession"
+XINITRC
+        ui_ok "~/.xinitrc written (fallback for startx)"
+    else
+        ui_skip "~/.xinitrc already exists, not overwriting"
+    fi
+
+    # Merge Xresources into the current Xrdb if X is running (informational only)
+    if [ -n "${DISPLAY:-}" ]; then
+        run_cmd_quiet "xrdb merge .Xresources" \
+            su -c "xrdb -merge '${TARGET_HOME}/.Xresources'" "${TARGET_USER}" 2>/dev/null || true
+        ui_info "Xresources merged into running X session"
+    fi
+
+    # Sensor initialisation (for lm_sensors / htop display)
+    ui_step "Initialising hardware sensors"
+    if command -v sensors-detect >/dev/null 2>&1; then
+        run_cmd_quiet "sensors-detect auto" sensors-detect --auto 2>/dev/null || true
+        ui_ok "sensors-detect completed (non-interactive)"
+    else
+        ui_info "sensors-detect not available; skip"
+    fi
+
+    # Set default locale if not configured
+    ui_step "Checking locale configuration"
+    if ! locale 2>/dev/null | grep -q 'LANG='; then
+        ui_info "LANG not set system-wide; will rely on user profile"
+        log_info "System locale not configured — user profile sets LANG"
+    else
+        ui_ok "System locale: $(locale 2>/dev/null | grep '^LANG=' | head -1)"
+    fi
+
+    # Final ownership sweep on target home
+    ui_step "Final ownership verification"
+    chown "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${TARGET_HOME}"
+    chown -R "${TARGET_USER}:$(id -gn "${TARGET_USER}")" \
+        "${TARGET_HOME}/.fluxbox" \
+        "${TARGET_HOME}/.config" \
+        "${TARGET_HOME}/.local" \
+        "${TARGET_HOME}/.ssh" \
+        2>/dev/null || true
+    ui_ok "Ownership verified for ${TARGET_HOME}"
+
+    chk_mark "11_user_env"
+    ui_ok "User environment finalised."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 21 — VALIDATION CHECKS
+# ---------------------------------------------------------------------------
+
+stage_validate() {
+    ui_stage "12" "Post-Installation Validation"
+    log_stage "VALIDATE"
+
+    typeset val_ok=1
+
+    # --- Critical binary checks ---
+    ui_step "Validating critical binaries"
+    typeset binary
+    for binary in X xdm fluxbox xterm feh dunst nm-applet amixer pipewire; do
+        if command -v "${binary}" >/dev/null 2>&1; then
+            log_info "Binary OK: ${binary} ($(command -v "${binary}"))"
+        else
+            ui_warn "Binary not found: ${binary}"
+            log_warn "Binary missing: ${binary}"
+            # Only some are truly critical
+            case "${binary}" in
+                X|xdm|fluxbox|xterm|amixer)
+                    ui_fail "CRITICAL binary missing: ${binary}"
+                    val_ok=0
+                    ;;
+            esac
+        fi
+    done
+    [ "${val_ok}" -eq 1 ] && ui_ok "Critical binaries present"
+
+    # --- Configuration files ---
+    ui_step "Validating configuration files"
+    typeset conf
+    for conf in \
+        /etc/X11/xdm/xdm-config \
+        /etc/X11/xdm/Xsession \
+        /etc/X11/xdm/Xservers \
+        /etc/X11/xorg.conf.d/00-keyboard.conf \
+        "${TARGET_HOME}/.xsession" \
+        "${TARGET_HOME}/.fluxbox/init" \
+        "${TARGET_HOME}/.fluxbox/keys" \
+        "${TARGET_HOME}/.fluxbox/menu" \
+        "${TARGET_HOME}/.Xresources"
+    do
+        if [ -f "${conf}" ]; then
+            log_info "Config OK: ${conf}"
+        else
+            ui_warn "Config missing: ${conf}"
+            log_warn "Config file missing: ${conf}"
+            val_ok=0
+        fi
+    done
+    [ "${val_ok}" -eq 1 ] && ui_ok "All configuration files present"
+
+    # --- .xsession executable ---
+    ui_step "Validating ~/.xsession is executable"
+    if [ -x "${TARGET_HOME}/.xsession" ]; then
+        ui_ok "~/.xsession is executable"
+    else
+        ui_fail "~/.xsession is not executable"
+        log_error "~/.xsession missing execute bit"
+        chmod +x "${TARGET_HOME}/.xsession"
+        ui_ok "~/.xsession execute bit corrected"
+    fi
+
+    # --- XDM Xsession executable ---
+    if [ -x /etc/X11/xdm/Xsession ]; then
+        ui_ok "/etc/X11/xdm/Xsession is executable"
+    else
+        chmod +x /etc/X11/xdm/Xsession
+        ui_ok "/etc/X11/xdm/Xsession execute bit corrected"
+    fi
+
+    # --- OpenRC service check ---
+    ui_step "Validating OpenRC services"
+    typeset svc
+    for svc in xdm NetworkManager; do
+        if svc_enabled "${svc}" default 2>/dev/null || svc_enabled "${svc}" boot 2>/dev/null; then
+            ui_ok "Service enabled: ${svc}"
+        else
+            ui_warn "Service not enabled: ${svc}"
+        fi
+    done
+
+    # --- XKB layout post-install ---
+    ui_step "Validating XKB layout file"
+    if [ -f "/usr/share/X11/xkb/symbols/${KBD_LAYOUT}" ]; then
+        ui_ok "XKB layout confirmed: ${KBD_LAYOUT}"
+    else
+        ui_fail "XKB layout file still missing: /usr/share/X11/xkb/symbols/${KBD_LAYOUT}"
+        val_ok=0
+    fi
+
+    # --- Intel GPU driver check ---
+    if [ "${HW_IS_INTEL_GPU}" -eq 1 ]; then
+        ui_step "Validating Intel graphics"
+        if pkg_installed mesa; then
+            ui_ok "Mesa installed"
+        else
+            ui_warn "Mesa not installed — Intel acceleration unavailable"
+        fi
+        if [ "${HW_GPU_DRIVER_RECOMMENDED}" = "modesetting" ]; then
+            ui_info "Using modesetting DDX (built into xorg-server)"
+        elif pkg_installed xf86-video-intel; then
+            ui_ok "xf86-video-intel DDX installed"
+        fi
+    fi
+
+    # --- Audio readiness ---
+    ui_step "Validating audio"
+    if command -v pipewire >/dev/null 2>&1; then
+        ui_ok "PipeWire binary present"
+    else
+        ui_warn "PipeWire not found — audio startup may fail"
+    fi
+    if command -v wireplumber >/dev/null 2>&1; then
+        ui_ok "WirePlumber binary present"
+    else
+        ui_warn "WirePlumber not found"
+    fi
+
+    # Summary
+    if [ "${val_ok}" -eq 1 ]; then
+        log_info "Validation: PASSED"
+        ui_ok "Validation passed"
+    else
+        log_warn "Validation: WARNINGS — review log"
+        ui_warn "Validation completed with warnings — review log: ${LOGFILE}"
+    fi
+
+    chk_mark "12_validate"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 22 — FINAL REPORT
+# ---------------------------------------------------------------------------
+
+stage_final_report() {
+    ui_stage "13" "Final Report"
+    log_stage "FINAL_REPORT"
+
+    typeset stage_count=0 done_count=0 f tag ts
+    for f in "${STATE_DIR}"/stage_*.done; do
+        [ -f "${f}" ] || continue
+        stage_count=$(( stage_count + 1 ))
+        done_count=$(( done_count + 1 ))
+        tag=$(basename "${f}" ".done")
+        ts=$(cat "${f}" 2>/dev/null)
+        log_info "Stage complete: ${tag} at ${ts}"
+    done
+
+    print ""
+    print -- "${C_BOLD}  ┌─ Setup Summary ────────────────────────────────────────────┐${C_RST}"
+    print -- "  │  Target user:       ${TARGET_USER}"
+    print -- "  │  Home:              ${TARGET_HOME}"
+    print -- "  │  Keyboard:          ${KBD_LAYOUT} / ${KBD_VARIANT:-none} / ${KBD_MODEL}"
+    print -- "  │  CPU:               ${HW_CPU_MODEL}"
+    print -- "  │  GPU:               $([ "${HW_IS_INTEL_GPU}" -eq 1 ] && print "Intel (${HW_GPU_DRIVER_RECOMMENDED})" || print "Non-Intel / degraded")"
+    print -- "  │  Audio:             $([ "${HW_HAS_AUDIO}" -eq 1 ] && print "ALSA + PipeWire" || print "Not detected")"
+    print -- "  │  Profile:           $([ "${HW_IS_LAPTOP}" -eq 1 ] && print "Laptop" || print "Desktop")"
+    print -- "  │  Stages complete:   ${done_count}"
+    print -- "  │  Log file:          ${LOGFILE}"
+    print -- "  │  State dir:         ${STATE_DIR}"
+    print -- "  └────────────────────────────────────────────────────────────┘"
+    print ""
+    print -- "  ${C_BOLD}Next steps:${C_RST}"
+    print "    1. Reboot the machine"
+    print "    2. XDM login screen will appear on tty7 / vt7"
+    print "    3. Log in as '${TARGET_USER}' — Fluxbox will start"
+    print "    4. Right-click the desktop for the application menu"
+    print "    5. Super+T opens a terminal (XTerm)"
+    print ""
+    print "    If audio is silent: run  ${C_BOLD}pavucontrol${C_RST}  from the menu"
+    print "    Log file for troubleshooting: ${LOGFILE}"
+    print ""
+
+    log_info "Setup complete. Total stages: ${done_count}"
+    chk_mark "13_final_report"
+}
+
+# ---------------------------------------------------------------------------
+# SECTION 23 — MAIN EXECUTION FLOW
+# ---------------------------------------------------------------------------
+
+# Generic stage runner: checks checkpoint, runs function, marks done.
+# run_stage <tag> <display_name> <function>
+run_stage() {
+    typeset tag="$1" display="$2" fn="$3"
+
+    if chk_done "${tag}"; then
+        typeset done_ts
+        done_ts=$(cat "$(chk_file "${tag}")" 2>/dev/null)
+        ui_skip "Stage already complete: ${display} (${done_ts})"
+        log_info "Skipping completed stage: ${tag}"
+        return 0
+    fi
+
+    log_stage "BEGIN ${tag}: ${display}"
+    "${fn}"
+    typeset fn_rc=$?
+
+    if [ "${fn_rc}" -ne 0 ]; then
+        ui_final_fail
+        ui_fail "Stage failed: ${display}"
+        log_error "Stage ${tag} returned non-zero: ${fn_rc}"
+        print ""
+        print -- "  Re-run the script to resume from this point:"
+        print -- "  ${SCRIPT_NAME} -u '${TARGET_USER}' -k '${KBD_LAYOUT}'${KBD_VARIANT:+ -V '${KBD_VARIANT}'}"
+        print ""
+        exit 1
+    fi
+
+    log_stage "END ${tag}: ${display}"
+    return 0
+}
+
+main() {
+    # ---- Argument parsing (before any output beyond usage) ----
+    parse_args "$@"
+
+    # ---- Banner ----
+    ui_banner
+    print -- "  ${C_BOLD}${SCRIPT_NAME}${C_RST} ${SCRIPT_VERSION} — PID ${SCRIPT_PID}"
+    print -- "  $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    if [ "${FORCE_RERUN}" -eq 1 ]; then
+        ui_warn "Force rerun mode: all stage checkpoints will be ignored."
+    fi
+
+    # ---- Show resume status (if any checkpoints already exist) ----
+    # We need STATE_DIR to exist; it will be created in preflight.
+    # Only show status if STATE_DIR already exists from a prior run.
+    if [ -d "${STATE_DIR}" ]; then
+        chk_show_resume_status
+    fi
+
+    # ---- Staged execution ----
+    run_stage "01_preflight"      "Preflight Validation"           stage_preflight
+    run_stage "02_hardware"       "Hardware Discovery"             stage_hardware
+    run_stage "03_packages"       "Package Installation"           stage_packages
+    run_stage "04_services"       "OpenRC Service Configuration"   stage_services
+    run_stage "05_graphics"       "Graphics and X11 Setup"         stage_graphics
+    run_stage "06_xdm"            "XDM Display Manager Setup"      stage_xdm
+    run_stage "07_fluxbox"        "Fluxbox Desktop Setup"          stage_fluxbox
+    run_stage "08_audio"          "Audio Configuration"            stage_audio
+    run_stage "09_keyboard"       "Keyboard Persistence"           stage_keyboard
+    run_stage "10_desktop_config" "Desktop Software Config"        stage_desktop_config
+    run_stage "11_user_env"       "User Environment Finalisation"  stage_user_env
+    run_stage "12_validate"       "Post-Install Validation"        stage_validate
+    run_stage "13_final_report"   "Final Report"                   stage_final_report
+
+    # ---- Cleanup temp dir ----
+    rm -rf "${TMP_DIR}" 2>/dev/null || true
+
+    ui_final_ok
+    return 0
+}
+
+# Trap unexpected exits and signal cleanly
+trap '
+    rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        ui_fail "Unexpected exit (code ${rc}). Re-run to resume."
+        log_error "Unexpected exit code: ${rc}"
+    fi
+    rm -rf "${TMP_DIR}" 2>/dev/null || true
+' EXIT
+
+main "$@"
