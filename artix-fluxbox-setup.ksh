@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.11.1"
+readonly SCRIPT_VERSION="1.0.12.2"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -1514,7 +1514,9 @@ stage_fluxbox() {
     typeset fb_style_dir="${fb_dir}/styles"
     typeset xsession_path="${TARGET_HOME}/.xsession"
     typeset user_group
-    typeset fb_style_file="/usr/share/fluxbox/styles/bloe"
+    typeset fb_style_name="bloe"
+    typeset fb_style_path="/usr/share/fluxbox/styles/bloe"
+    typeset fb_style_cfg=""
     typeset fb_root_bg="#1a1a2e"
 
     user_group=$(id -gn "${TARGET_USER}")
@@ -1523,10 +1525,13 @@ stage_fluxbox() {
     ensure_dir "${fb_style_dir}" "${TARGET_USER}:${user_group}" "755"
 
     if [ "${GNOME1_THEME}" -eq 1 ]; then
-        fb_style_file="${fb_style_dir}/gnome1-strong"
+        fb_style_name="gnome1-strong"
+        fb_style_path="${fb_style_dir}/${fb_style_name}"
+        fb_style_cfg="${fb_style_path}/theme.cfg"
         fb_root_bg="#2f6b68"
+        ensure_dir "${fb_style_path}" "${TARGET_USER}:${user_group}" "755"
         ui_step "Writing GNOME 1-inspired Fluxbox style"
-        write_user_file "${fb_style_file}" "644" <<'FBSTYLE'
+        write_user_file "${fb_style_cfg}" "644" <<'FBSTYLE'
 window.font: Sans-10
 window.justify: Center
 window.title.height: 22
@@ -1607,9 +1612,9 @@ FBSTYLE
             return 1
         fi
         ui_ok "GNOME 1-inspired Fluxbox style written"
-        log_info "Fluxbox style profile: gnome1-strong (${fb_style_file})"
+        log_info "Fluxbox style profile: gnome1-strong (${fb_style_cfg})"
     else
-        log_info "Fluxbox style profile: default (${fb_style_file})"
+        log_info "Fluxbox style profile: default (${fb_style_path})"
     fi
 
     ui_step "Writing user ~/.xsession"
@@ -1699,7 +1704,8 @@ session.screen0.tabs.maxWidth: 200
 session.screen0.tabs.usePixmap: true
 session.screen0.antialias: true
 session.screen0.imageControl: cache
-session.screen0.styleFile: ${fb_style_file}
+session.styleFile: ${fb_style_path}
+session.styleOverlay: ${TARGET_HOME}/.fluxbox/overlay
 session.menuFile: ${TARGET_HOME}/.fluxbox/menu
 session.keyFile: ${TARGET_HOME}/.fluxbox/keys
 session.appsFile: ${TARGET_HOME}/.fluxbox/apps
