@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.0.8"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -344,6 +344,112 @@ svc_disable() {
         log_svc "Disabled: ${svc} in runlevel ${runlevel}"
         ui_ok "Service disabled: ${svc} (${runlevel})"
     fi
+}
+
+svc_require_enabled() {
+    typeset svc="$1" runlevel="${2:-default}"
+    svc_enable "${svc}" "${runlevel}"
+    if svc_enabled "${svc}" "${runlevel}"; then
+        log_svc "Verified enabled: ${svc}@${runlevel}"
+        return 0
+    fi
+    log_error "Required service is not enabled: ${svc}@${runlevel}"
+    ui_fail "Required service is not enabled: ${svc} (${runlevel})"
+    return 1
+}
+
+svc_wait_active() {
+    typeset svc="$1" max_wait="${2:-5}" i=1
+    while [ "${i}" -le "${max_wait}" ]; do
+        if rc-service "${svc}" status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$(( i + 1 ))
+    done
+    return 1
+}
+
+svc_start_or_restart() {
+    typeset svc="$1"
+    if rc-service "${svc}" status >/dev/null 2>&1; then
+        run_cmd_quiet "Restart ${svc}" rc-service "${svc}" restart
+    else
+        run_cmd_quiet "Start ${svc}" rc-service "${svc}" start
+    fi
+    [ "${RC}" -eq 0 ] || return 1
+    svc_wait_active "${svc}" 5 || return 1
+    return 0
+}
+
+resolve_xdm_service_name() {
+    typeset candidate found
+    for candidate in xdm xorg-xdm; do
+        if svc_exists "${candidate}"; then
+            print -- "${candidate}"
+            return 0
+        fi
+    done
+    found=$(find /etc/init.d -maxdepth 1 -type f \( -name 'xdm' -o -name 'xorg-xdm' \) 2>/dev/null | head -1)
+    [ -n "${found}" ] || return 1
+    basename "${found}"
+}
+
+xdm_server_path() {
+    typeset candidate
+    for candidate in /usr/bin/X /usr/bin/Xorg /usr/lib/Xorg /usr/libexec/Xorg; do
+        if [ -x "${candidate}" ]; then
+            print -- "${candidate}"
+            return 0
+        fi
+    done
+    if command -v X >/dev/null 2>&1; then
+        command -v X
+        return 0
+    fi
+    if command -v Xorg >/dev/null 2>&1; then
+        command -v Xorg
+        return 0
+    fi
+    return 1
+}
+
+xdm_activate_required() {
+    typeset xdm_svc
+    xdm_svc=$(resolve_xdm_service_name) || {
+        log_error "XDM init script not found during activation"
+        ui_fail "XDM init script not found during activation"
+        return 1
+    }
+
+    svc_require_enabled "${xdm_svc}" default || return 1
+
+    if [ ! -f /etc/conf.d/xdm ] || ! grep -q '^DISPLAYMANAGER="xdm"$' /etc/conf.d/xdm 2>/dev/null; then
+        log_error "/etc/conf.d/xdm missing or does not select xdm"
+        ui_fail "/etc/conf.d/xdm is missing or does not select xdm"
+        return 1
+    fi
+
+    if svc_start_or_restart "${xdm_svc}"; then
+        ui_ok "XDM service active: ${xdm_svc}"
+        log_svc "XDM active: ${xdm_svc}"
+        return 0
+    fi
+
+    if [ "${xdm_svc}" != "xdm" ] && svc_exists xdm; then
+        ui_warn "Primary XDM service '${xdm_svc}' failed; trying fallback 'xdm'"
+        log_warn "XDM activation fallback: ${xdm_svc} -> xdm"
+        svc_require_enabled xdm default || return 1
+        if svc_start_or_restart xdm; then
+            ui_ok "XDM service active via fallback: xdm"
+            log_svc "XDM active via fallback: xdm"
+            return 0
+        fi
+    fi
+
+    log_error "XDM service could not be started successfully"
+    ui_fail "XDM service could not be started successfully"
+    return 1
 }
 
 show_help() {
@@ -1032,23 +1138,17 @@ stage_services() {
         fi
     done
 
-    ui_step "Configuring XDM service"
-    if svc_exists xdm; then
-        svc_enable xdm default
-    else
-        ui_warn "XDM init script not found at /etc/init.d/xdm"
-        log_warn "XDM init script missing — package install may have placed it elsewhere"
-        typeset xdm_script
-        xdm_script=$(find /etc/init.d -name 'xdm' -o -name 'xorg-xdm' 2>/dev/null | head -1)
-        if [ -n "${xdm_script}" ]; then
-            typeset xdm_name
-            xdm_name=$(basename "${xdm_script}")
-            svc_enable "${xdm_name}" default
-        else
-            ui_fail "Cannot locate XDM init script. XDM will not start on boot."
-            log_error "XDM init script not found anywhere in /etc/init.d"
-        fi
-    fi
+    ui_step "Resolving required XDM service"
+    typeset xdm_svc
+    xdm_svc=$(resolve_xdm_service_name) || {
+        ui_fatal "Cannot locate XDM init script under /etc/init.d. XDM is a hard requirement."
+        log_error "XDM init script not found anywhere in /etc/init.d"
+        return 1
+    }
+    ui_ok "XDM init script: ${xdm_svc}"
+
+    ui_step "Enabling required XDM service"
+    svc_require_enabled "${xdm_svc}" default || return 1
 
     ui_step "Configuring NetworkManager service"
     if svc_exists NetworkManager; then
@@ -1210,6 +1310,22 @@ stage_xdm() {
     typeset xdm_vardir="/var/lib/xdm"
     typeset xdm_confdir="/etc/conf.d"
     typeset xdm_service_conf="${xdm_confdir}/xdm"
+    typeset x_server_bin xdm_svc
+
+    xdm_svc=$(resolve_xdm_service_name) || {
+        ui_fatal "Cannot locate XDM init script. XDM is a hard requirement."
+        return 1
+    }
+
+    if ! command -v xdm >/dev/null 2>&1; then
+        ui_fatal "The xdm binary is missing even though XDM is required. Ensure xorg-xdm installed correctly."
+        return 1
+    fi
+
+    x_server_bin=$(xdm_server_path) || {
+        ui_fatal "Cannot locate the X server binary (X/Xorg)."
+        return 1
+    }
 
     ensure_dir "${xdm_dir}" "root:root" "755"
     ensure_dir "${xdm_vardir}" "root:root" "755"
@@ -1248,7 +1364,7 @@ XDMCFG
     ui_step "Writing Xservers file"
     write_file "${xdm_dir}/Xservers" "root:root" "644" <<XSERVERS
 # Xservers — managed by ${SCRIPT_NAME}
-:0 local /usr/bin/X :0 vt7 -nolisten tcp
+:0 local ${x_server_bin} :0 vt7 -nolisten tcp
 XSERVERS
     ui_ok "Xservers configured"
 
@@ -2120,20 +2236,44 @@ stage_validate() {
     if [ -f /etc/conf.d/xdm ] && grep -q '^DISPLAYMANAGER="xdm"$' /etc/conf.d/xdm 2>/dev/null; then
         ui_ok "/etc/conf.d/xdm selects xdm"
     else
-        ui_warn "/etc/conf.d/xdm is missing or does not select xdm"
-        log_warn "/etc/conf.d/xdm missing or DISPLAYMANAGER is not xdm"
+        ui_fail "/etc/conf.d/xdm is missing or does not select xdm"
+        log_error "/etc/conf.d/xdm missing or DISPLAYMANAGER is not xdm"
         val_ok=0
     fi
 
-    ui_step "Validating OpenRC services"
-    typeset svc
-    for svc in xdm NetworkManager; do
+    ui_step "Validating required XDM service registration"
+    typeset xdm_svc svc
+    xdm_svc=$(resolve_xdm_service_name) || {
+        ui_fail "XDM init script is missing"
+        log_error "XDM init script missing during validation"
+        val_ok=0
+    }
+    if [ -n "${xdm_svc:-}" ]; then
+        if svc_enabled "${xdm_svc}" default 2>/dev/null || svc_enabled "${xdm_svc}" boot 2>/dev/null; then
+            ui_ok "Required XDM service enabled: ${xdm_svc}"
+        else
+            ui_fail "Required XDM service is not enabled: ${xdm_svc}"
+            log_error "Required XDM service is not enabled: ${xdm_svc}"
+            val_ok=0
+        fi
+    fi
+
+    ui_step "Validating optional OpenRC services"
+    for svc in NetworkManager; do
         if svc_enabled "${svc}" default 2>/dev/null || svc_enabled "${svc}" boot 2>/dev/null; then
             ui_ok "Service enabled: ${svc}"
         else
-            ui_warn "Service not enabled: ${svc}"
+            ui_warn "Optional service not enabled: ${svc}"
         fi
     done
+
+    ui_step "Starting and verifying XDM service"
+    if xdm_activate_required; then
+        ui_ok "XDM startup verification passed"
+    else
+        log_error "XDM activation verification failed"
+        val_ok=0
+    fi
 
     ui_step "Validating XKB layout file"
     if [ -f "/usr/share/X11/xkb/symbols/${KBD_LAYOUT}" ]; then
@@ -2172,20 +2312,27 @@ stage_validate() {
     if [ "${val_ok}" -eq 1 ]; then
         log_info "Validation: PASSED"
         ui_ok "Validation passed"
-    else
-        log_warn "Validation: WARNINGS — review log"
-        ui_warn "Validation completed with warnings — review log: ${LOGFILE}"
+        chk_mark "12_validate"
+        return 0
     fi
 
-    chk_mark "12_validate"
-    return 0
+    log_error "Validation failed — critical requirements not satisfied"
+    ui_fail "Validation failed — review log: ${LOGFILE}"
+    return 1
 }
 
 stage_final_report() {
     ui_stage "13" "Final Report"
     log_stage "FINAL_REPORT"
 
-    typeset stage_count=0 done_count=0 f tag ts
+    typeset stage_count=0 done_count=0 f tag ts xdm_svc xdm_state
+    xdm_svc=$(resolve_xdm_service_name 2>/dev/null || true)
+    xdm_state="not detected"
+    if [ -n "${xdm_svc}" ] && rc-service "${xdm_svc}" status >/dev/null 2>&1; then
+        xdm_state="active (${xdm_svc})"
+    elif [ -n "${xdm_svc}" ]; then
+        xdm_state="enabled or configured, not active (${xdm_svc})"
+    fi
     for f in "${STATE_DIR}"/stage_*.done; do
         [ -f "${f}" ] || continue
         stage_count=$(( stage_count + 1 ))
@@ -2204,14 +2351,15 @@ stage_final_report() {
     print -- "  │  GPU:               $([ "${HW_IS_INTEL_GPU}" -eq 1 ] && print "Intel (${HW_GPU_DRIVER_RECOMMENDED})" || print "Non-Intel / degraded")"
     print -- "  │  Audio:             $([ "${HW_HAS_AUDIO}" -eq 1 ] && print "ALSA + PipeWire" || print "Not detected")"
     print -- "  │  Profile:           $([ "${HW_IS_LAPTOP}" -eq 1 ] && print "Laptop" || print "Desktop")"
+    print -- "  │  XDM:               ${xdm_state}"
     print -- "  │  Stages complete:   ${done_count}"
     print -- "  │  Log file:          ${LOGFILE}"
     print -- "  │  State dir:         ${STATE_DIR}"
     print -- "  └────────────────────────────────────────────────────────────┘"
     print ""
     print -- "  ${C_BOLD}Next steps:${C_RST}"
-    print "    1. Reboot the machine, or run rc-service xdm restart"
-    print "    2. XDM login screen will appear on tty7 / vt7"
+    print "    1. XDM has been configured and verified as a required component"
+    print "    2. If the login screen is not visible yet, switch to tty7 / vt7 or reboot once"
     print "    3. Log in as '${TARGET_USER}' — Fluxbox will start"
     print "    4. Right-click the desktop for the application menu"
     print "    5. Super+T opens a terminal (XTerm)"
