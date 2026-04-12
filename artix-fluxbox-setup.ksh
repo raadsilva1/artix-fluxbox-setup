@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.9"
+readonly SCRIPT_VERSION="1.0.10"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -30,6 +30,7 @@ KBD_OPTIONS=""
 FORCE_RERUN=0
 FORCE_REINSTALL_PACKAGES=0
 AUTO_RETRY_ON_ERROR=0
+GNOME1_THEME=0
 MAX_AUTO_RETRIES=5
 CURRENT_ATTEMPT=1
 LAST_FAILED_STAGE=""
@@ -485,12 +486,14 @@ show_help() {
     print "  -f            Force re-run all stages (ignore resume checkpoints)"
     print "  -R            Force reinstall packages during package stage"
     print "  -a            On any stage error, restart from stage 1 (max 5 attempts)"
+    print "  -1            Use a GNOME 1-inspired Fluxbox style profile"
     print "  -h            Show this help and exit"
     print ""
     print -- "${C_BOLD}EXAMPLES${C_RST}"
     print "  ${SCRIPT_NAME} -u alice -k us"
     print "  ${SCRIPT_NAME} -u bob   -k br -V abnt2 -R"
     print "  ${SCRIPT_NAME} -u carol -k de -V nodeadkeys -m pc105 -a"
+    print "  ${SCRIPT_NAME} -u dave  -k us -1"
     print ""
     print "  Log file:   ${LOGFILE}"
     print "  State dir:  ${STATE_DIR}"
@@ -500,7 +503,7 @@ show_help() {
 
 parse_args() {
     typeset opt
-    while getopts "u:k:V:m:o:fRah" opt; do
+    while getopts "u:k:V:m:o:fRa1h" opt; do
         case "${opt}" in
             u) TARGET_USER="${OPTARG}" ;;
             k) KBD_LAYOUT="${OPTARG}" ;;
@@ -510,6 +513,7 @@ parse_args() {
             f) FORCE_RERUN=1 ;;
             R) FORCE_REINSTALL_PACKAGES=1 ;;
             a) AUTO_RETRY_ON_ERROR=1 ;;
+            1) GNOME1_THEME=1 ;;
             h) show_help; exit 0 ;;
             ?) show_help; exit 2 ;;
         esac
@@ -734,6 +738,7 @@ stage_preflight() {
     ui_kv "Force rerun"     "$([ "${FORCE_RERUN}" -eq 1 ] && print yes || print no)"
     ui_kv "Force reinstall" "$([ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ] && print yes || print no)"
     ui_kv "Auto retry"      "$([ "${AUTO_RETRY_ON_ERROR}" -eq 1 ] && print yes || print no)"
+    ui_kv "GNOME 1 style"   "$([ "${GNOME1_THEME}" -eq 1 ] && print yes || print no)"
     ui_kv "Log file"        "${LOGFILE}"
     ui_sep
 
@@ -1435,36 +1440,12 @@ XSERVERS
 XACCESS
     ui_ok "Xaccess configured (local only)"
 
-    ui_step "Writing XDM Xresources (login screen appearance)"
+    ui_step "Writing minimal XDM Xresources override"
     write_file "${xdm_dir}/Xresources" "root:root" "644" <<XRES
-! XDM login screen resources — managed by ${SCRIPT_NAME}
-xlogin*login.translations: #override\
-    <Key>Return:    set-session-argument() finish-field()\n\
-    Ctrl<Key>Return: set-session-argument(failsafe) finish-field()
-
-xlogin*borderWidth:       1
-xlogin*greeting:          Artix Linux — Fluxbox Desktop
-xlogin*namePrompt:        Login:\040
-xlogin*passwdPrompt:      Password:\040
-
-xlogin*background:        #1a1a2e
-xlogin*foreground:        #c8ccd4
-xlogin*borderColor:       #4a4e69
-xlogin*font:              -misc-fixed-medium-r-normal--15-*-*-*-*-*-*-*
-
-xlogin*greetFont:         -misc-fixed-bold-r-normal--18-*-*-*-*-*-*-*
-xlogin*greetColor:        #7eb6ff
-
-xlogin*promptFont:        -misc-fixed-medium-r-normal--13-*-*-*-*-*-*-*
-xlogin*promptColor:       #adb5bd
-
-xlogin*inputFont:         -misc-fixed-medium-r-normal--13-*-*-*-*-*-*-*
-xlogin*inputColor:        #e8eaf0
-
-xlogin*frameWidth:        2
-xlogin*innerFramesWidth:  2
+! Minimal XDM resource override — managed by ${SCRIPT_NAME}
+xlogin*greeting:          Artix
 XRES
-    ui_ok "XDM Xresources written"
+    ui_ok "Minimal XDM Xresources written"
 
     ui_step "Writing XDM Xsession script"
     write_file "${xdm_dir}/Xsession" "root:root" "755" <<'XSESS'
@@ -1501,14 +1482,10 @@ exec /usr/bin/fluxbox
 XSESS
     ui_ok "XDM Xsession script written"
 
-    ui_step "Writing Xsetup_0 script"
-    write_file "${xdm_dir}/Xsetup_0" "root:root" "755" <<'XSETUP'
-#!/bin/sh
-# XDM Xsetup_0 — runs as root before login dialog appears
-# Set a plain background colour for the login screen.
-xsetroot -solid '#1a1a2e' 2>/dev/null || true
-XSETUP
-    ui_ok "Xsetup_0 written"
+    ui_step "Removing custom Xsetup_0 override"
+    backup_file "${xdm_dir}/Xsetup_0"
+    rm -f "${xdm_dir}/Xsetup_0"
+    ui_ok "Custom Xsetup_0 removed"
 
     log_info "XDM configuration complete in ${xdm_dir}"
     chk_mark "06_xdm"
@@ -1534,9 +1511,106 @@ stage_fluxbox() {
     log_stage "FLUXBOX"
 
     typeset fb_dir="${TARGET_HOME}/.fluxbox"
+    typeset fb_style_dir="${fb_dir}/styles"
     typeset xsession_path="${TARGET_HOME}/.xsession"
+    typeset user_group
+    typeset fb_style_file="/usr/share/fluxbox/styles/bloe"
+    typeset fb_root_bg="#1a1a2e"
 
-    ensure_dir "${fb_dir}" "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "700"
+    user_group=$(id -gn "${TARGET_USER}")
+
+    ensure_dir "${fb_dir}" "${TARGET_USER}:${user_group}" "700"
+    ensure_dir "${fb_style_dir}" "${TARGET_USER}:${user_group}" "755"
+
+    if [ "${GNOME1_THEME}" -eq 1 ]; then
+        fb_style_file="${fb_style_dir}/gnome1-strong"
+        fb_root_bg="#2f6b68"
+        ui_step "Writing GNOME 1-inspired Fluxbox style"
+        write_user_file "${fb_style_file}" "644" <<'FBSTYLE'
+window.font: Sans-10
+window.justify: Center
+window.title.height: 22
+window.label.focus.textColor: #ffffff
+window.label.unfocus.textColor: #000000
+window.button.focus.picColor: #ffffff
+window.button.unfocus.picColor: #3a3a3a
+window.borderWidth: 1
+window.borderColor: #6f777d
+window.bevelWidth: 1
+window.handleWidth: 4
+window.title.focus: Flat Solid
+window.title.focus.color: #345d92
+window.title.focus.colorTo: #345d92
+window.title.unfocus: Flat Solid
+window.title.unfocus.color: #c9c9c2
+window.title.unfocus.colorTo: #c9c9c2
+window.label.focus: ParentRelative
+window.label.unfocus: ParentRelative
+window.handle.focus: Flat Solid
+window.handle.focus.color: #c9c9c2
+window.handle.unfocus: Flat Solid
+window.handle.unfocus.color: #c9c9c2
+window.grip.focus: Flat Solid
+window.grip.focus.color: #6f777d
+window.grip.unfocus: Flat Solid
+window.grip.unfocus.color: #8a8f95
+
+menu.title.font: Sans:bold:size=10
+menu.title.justify: Center
+menu.title: Raised Bevel1 Gradient Vertical
+menu.title.color: #345d92
+menu.title.colorTo: #274971
+menu.title.textColor: #ffffff
+menu.frame.font: Sans-10
+menu.frame: Flat Solid
+menu.frame.color: #d7d7d1
+menu.frame.textColor: #000000
+menu.hilite: Flat Solid
+menu.hilite.color: #345d92
+menu.hilite.textColor: #ffffff
+menu.borderWidth: 1
+menu.borderColor: #6f777d
+
+toolbar.font: Sans:bold:size=10
+toolbar.justify: Center
+toolbar.height: 24
+toolbar: Flat Solid
+toolbar.color: #c9c9c2
+toolbar.colorTo: #c9c9c2
+toolbar.borderWidth: 1
+toolbar.borderColor: #6f777d
+toolbar.button: Raised Bevel1 Gradient Vertical
+toolbar.button.color: #dfdfd8
+toolbar.button.colorTo: #bdbdb5
+toolbar.button.picColor: #2e3440
+toolbar.clock: ParentRelative
+toolbar.clock.textColor: #000000
+toolbar.workspace: Raised Bevel1 Gradient Vertical
+toolbar.workspace.color: #dfdfd8
+toolbar.workspace.colorTo: #bdbdb5
+toolbar.workspace.textColor: #000000
+toolbar.iconbar.focused: Raised Bevel1 Gradient Vertical
+toolbar.iconbar.focused.color: #345d92
+toolbar.iconbar.focused.colorTo: #274971
+toolbar.iconbar.focused.textColor: #ffffff
+toolbar.iconbar.unfocused: Raised Bevel1 Gradient Vertical
+toolbar.iconbar.unfocused.color: #dfdfd8
+toolbar.iconbar.unfocused.colorTo: #bdbdb5
+toolbar.iconbar.unfocused.textColor: #000000
+
+slit: Flat Solid
+slit.color: #c9c9c2
+slit.colorTo: #c9c9c2
+FBSTYLE
+        if [ $? -ne 0 ]; then
+            ui_fatal "Could not write GNOME 1-inspired Fluxbox style."
+            return 1
+        fi
+        ui_ok "GNOME 1-inspired Fluxbox style written"
+        log_info "Fluxbox style profile: gnome1-strong (${fb_style_file})"
+    else
+        log_info "Fluxbox style profile: default (${fb_style_file})"
+    fi
 
     ui_step "Writing user ~/.xsession"
     backup_file "${xsession_path}"
@@ -1582,7 +1656,7 @@ dunst -config "\${HOME}/.config/dunst/dunstrc" &
 nm-applet 2>/dev/null &
 
 # Set background colour (feh will override if wallpaper exists)
-xsetroot -solid '#1a1a2e'
+xsetroot -solid '${fb_root_bg}'
 
 # Start Fluxbox
 exec fluxbox
@@ -1632,7 +1706,7 @@ session.screen0.tabs.maxWidth: 200
 session.screen0.tabs.usePixmap: true
 session.screen0.antialias: true
 session.screen0.imageControl: cache
-session.screen0.styleFile: /usr/share/fluxbox/styles/bloe
+session.screen0.styleFile: ${fb_style_file}
 session.menuFile: ${TARGET_HOME}/.fluxbox/menu
 session.keyFile: ${TARGET_HOME}/.fluxbox/keys
 session.appsFile: ${TARGET_HOME}/.fluxbox/apps
@@ -2491,6 +2565,9 @@ main() {
     fi
     if [ "${AUTO_RETRY_ON_ERROR}" -eq 1 ]; then
         ui_warn "Auto retry mode: any stage failure restarts from stage 1 (max ${MAX_AUTO_RETRIES} attempts)."
+    fi
+    if [ "${GNOME1_THEME}" -eq 1 ]; then
+        ui_warn "GNOME 1 style mode: Fluxbox will use a classic GNOME 1-inspired visual profile."
     fi
 
     if [ -d "${STATE_DIR}" ]; then
