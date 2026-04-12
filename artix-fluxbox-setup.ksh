@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.5"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -13,6 +13,8 @@ readonly BACKUP_DIR="/var/backups/artix-fluxbox-setup"
 readonly LOG_DIR="/var/log"
 readonly LOGFILE="${LOG_DIR}/artix-fluxbox-setup.log"
 readonly TMP_DIR="/tmp/artix-fluxbox-setup-${SCRIPT_PID}"
+readonly PACKAGE_STATUS_FILE="${STATE_DIR}/package-status.tsv"
+readonly PACKAGE_HISTORY_FILE="${STATE_DIR}/package-history.tsv"
 
 readonly STAGE_PREFIX="${STATE_DIR}/stage_"
 readonly STAGE_SUFFIX=".done"
@@ -26,6 +28,11 @@ KBD_VARIANT=""
 KBD_MODEL="pc105"
 KBD_OPTIONS=""
 FORCE_RERUN=0
+FORCE_REINSTALL_PACKAGES=0
+AUTO_RETRY_ON_ERROR=0
+MAX_AUTO_RETRIES=5
+CURRENT_ATTEMPT=1
+LAST_FAILED_STAGE=""
 
 HW_ARCH=""
 HW_CPU_VENDOR=""
@@ -161,6 +168,31 @@ log_svc()     { _log SVC     "$*"; }
 log_file()    { _log FILE    "$*"; }
 log_backup()  { _log BACKUP  "$*"; }
 log_chk()     { _log CHKPT   "$*"; }
+
+pkg_status_init() {
+    [ -d "${STATE_DIR}" ] || mkdir -p "${STATE_DIR}"
+    [ -f "${PACKAGE_HISTORY_FILE}" ] || print -- "package	status	attempt	timestamp	note" > "${PACKAGE_HISTORY_FILE}"
+    print -- "package	status	attempt	timestamp	note" > "${PACKAGE_STATUS_FILE}"
+}
+
+pkg_status_record() {
+    typeset pkg="$1" status="$2" note="${3:-}" ts tmp
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    note=$(print -- "${note}" | tr '\t\n' '  ')
+    tmp="${PACKAGE_STATUS_FILE}.tmp.$$"
+    {
+        grep -v "^${pkg}\t" "${PACKAGE_STATUS_FILE}" 2>/dev/null || true
+        print -- "${pkg}	${status}	${CURRENT_ATTEMPT}	${ts}	${note}"
+    } > "${tmp}"
+    mv -f "${tmp}" "${PACKAGE_STATUS_FILE}"
+    print -- "${pkg}	${status}	${CURRENT_ATTEMPT}	${ts}	${note}" >> "${PACKAGE_HISTORY_FILE}"
+    log_pkg "${pkg}: ${status} (attempt=${CURRENT_ATTEMPT} note=${note})"
+}
+
+clear_stage_checkpoints() {
+    rm -f "${STATE_DIR}"/stage_*.done 2>/dev/null || true
+    log_chk "Cleared all stage checkpoints"
+}
 
 chk_file() {
     print -- "${STAGE_PREFIX}${1}${STAGE_SUFFIX}"
@@ -332,12 +364,14 @@ show_help() {
     print "  -m <model>    X11 keyboard model     (default: pc105)"
     print "  -o <options>  X11 keyboard options   (e.g. grp:alt_shift_toggle)"
     print "  -f            Force re-run all stages (ignore resume checkpoints)"
+    print "  -R            Force reinstall packages during package stage"
+    print "  -a            On any stage error, restart from stage 1 (max 5 attempts)"
     print "  -h            Show this help and exit"
     print ""
     print -- "${C_BOLD}EXAMPLES${C_RST}"
     print "  ${SCRIPT_NAME} -u alice -k us"
-    print "  ${SCRIPT_NAME} -u bob   -k br -V abnt2"
-    print "  ${SCRIPT_NAME} -u carol -k de -V nodeadkeys -m pc105"
+    print "  ${SCRIPT_NAME} -u bob   -k br -V abnt2 -R"
+    print "  ${SCRIPT_NAME} -u carol -k de -V nodeadkeys -m pc105 -a"
     print ""
     print "  Log file:   ${LOGFILE}"
     print "  State dir:  ${STATE_DIR}"
@@ -347,7 +381,7 @@ show_help() {
 
 parse_args() {
     typeset opt
-    while getopts "u:k:V:m:o:fh" opt; do
+    while getopts "u:k:V:m:o:fRah" opt; do
         case "${opt}" in
             u) TARGET_USER="${OPTARG}" ;;
             k) KBD_LAYOUT="${OPTARG}" ;;
@@ -355,6 +389,8 @@ parse_args() {
             m) KBD_MODEL="${OPTARG}" ;;
             o) KBD_OPTIONS="${OPTARG}" ;;
             f) FORCE_RERUN=1 ;;
+            R) FORCE_REINSTALL_PACKAGES=1 ;;
+            a) AUTO_RETRY_ON_ERROR=1 ;;
             h) show_help; exit 0 ;;
             ?) show_help; exit 2 ;;
         esac
@@ -577,6 +613,8 @@ stage_preflight() {
     ui_kv "Kbd model"       "${KBD_MODEL}"
     ui_kv "Kbd options"     "${KBD_OPTIONS:-none}"
     ui_kv "Force rerun"     "$([ "${FORCE_RERUN}" -eq 1 ] && print yes || print no)"
+    ui_kv "Force reinstall" "$([ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ] && print yes || print no)"
+    ui_kv "Auto retry"      "$([ "${AUTO_RETRY_ON_ERROR}" -eq 1 ] && print yes || print no)"
     ui_kv "Log file"        "${LOGFILE}"
     ui_sep
 
@@ -887,6 +925,8 @@ stage_packages() {
     log_pkg "Package list: ${pkg_list}"
     ui_info "Packages queued: $(print -- "${pkg_list}" | wc -w | tr -d ' ')"
 
+    pkg_status_init
+
     ui_step "Synchronising package databases"
     run_cmd_quiet "pacman -Sy" pacman -Sy --noconfirm
     if [ "${RC}" -ne 0 ]; then
@@ -896,19 +936,39 @@ stage_packages() {
     fi
 
     ui_step "Installing packages (this may take several minutes)"
-    typeset pkg failed_pkgs="" installed_count=0 skip_count=0 fail_count=0
+    typeset pkg failed_pkgs="" installed_count=0 skip_count=0 fail_count=0 reinstalled_count=0
 
     for pkg in ${pkg_list}; do
+        if [ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ]; then
+            run_cmd_quiet "Reinstall ${pkg}" pacman -S --noconfirm "${pkg}"
+            if [ "${RC}" -eq 0 ]; then
+                pkg_status_record "${pkg}" "reinstalled" "pacman -S"
+                ui_ok "Reinstalled: ${pkg}"
+                reinstalled_count=$(( reinstalled_count + 1 ))
+            else
+                pkg_status_record "${pkg}" "reinstall_failed" "pacman returned ${RC}"
+                log_warn "Failed to reinstall: ${pkg}"
+                ui_warn "Package reinstall failed: ${pkg}"
+                failed_pkgs="${failed_pkgs} ${pkg}"
+                fail_count=$(( fail_count + 1 ))
+            fi
+            continue
+        fi
+
         if pkg_installed "${pkg}"; then
-            log_pkg "Already installed: ${pkg}"
+            pkg_status_record "${pkg}" "present" "already installed"
+            ui_skip "Already present: ${pkg}"
             skip_count=$(( skip_count + 1 ))
             continue
         fi
+
         run_cmd_quiet "Install ${pkg}" pacman -S --noconfirm --needed "${pkg}"
         if [ "${RC}" -eq 0 ]; then
-            log_pkg "Installed: ${pkg}"
+            pkg_status_record "${pkg}" "installed" "fresh install"
+            ui_ok "Installed: ${pkg}"
             installed_count=$(( installed_count + 1 ))
         else
+            pkg_status_record "${pkg}" "install_failed" "pacman returned ${RC}"
             log_warn "Failed to install: ${pkg}"
             ui_warn "Package unavailable or failed: ${pkg}"
             failed_pkgs="${failed_pkgs} ${pkg}"
@@ -916,8 +976,15 @@ stage_packages() {
         fi
     done
 
-    ui_ok "Installed: ${installed_count} packages"
-    ui_skip "Already present: ${skip_count} packages"
+    if [ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ]; then
+        ui_ok "Reinstalled: ${reinstalled_count} packages"
+    else
+        ui_ok "Installed: ${installed_count} packages"
+        ui_skip "Already present: ${skip_count} packages"
+    fi
+    ui_info "Package status file: ${PACKAGE_STATUS_FILE}"
+    ui_info "Package history file: ${PACKAGE_HISTORY_FILE}"
+
     if [ "${fail_count}" -gt 0 ]; then
         ui_warn "Failed packages (${fail_count}): ${failed_pkgs}"
         log_warn "Failed packages: ${failed_pkgs}"
@@ -927,13 +994,14 @@ stage_packages() {
     typeset critical_ok=1
     for pkg in xorg-server xorg-xdm fluxbox alsa-utils pipewire networkmanager; do
         if ! pkg_installed "${pkg}"; then
+            pkg_status_record "${pkg}" "critical_missing" "validation failed"
             ui_fail "Critical package missing: ${pkg}"
             log_error "Critical package missing after install: ${pkg}"
             critical_ok=0
         fi
     done
     if [ "${critical_ok}" -eq 0 ]; then
-        ui_fatal "One or more critical packages failed to install. Check log and network."
+        ui_fatal "One or more critical packages failed to install. Check log, package status file, and network."
         return 1
     fi
     ui_ok "Critical packages verified"
@@ -1140,9 +1208,19 @@ stage_xdm() {
 
     typeset xdm_dir="/etc/X11/xdm"
     typeset xdm_vardir="/var/lib/xdm"
+    typeset xdm_confdir="/etc/conf.d"
+    typeset xdm_service_conf="${xdm_confdir}/xdm"
 
     ensure_dir "${xdm_dir}" "root:root" "755"
     ensure_dir "${xdm_vardir}" "root:root" "755"
+    ensure_dir "${xdm_confdir}" "root:root" "755"
+
+    ui_step "Writing OpenRC display manager selector"
+    backup_file "${xdm_service_conf}"
+    write_file "${xdm_service_conf}" "root:root" "644" <<'XDMCONF'
+DISPLAYMANAGER="xdm"
+XDMCONF
+    ui_ok "/etc/conf.d/xdm configured for xdm"
 
     ui_step "Writing XDM configuration"
     typeset xdm_config="${xdm_dir}/xdm-config"
@@ -2000,6 +2078,7 @@ stage_validate() {
     ui_step "Validating configuration files"
     typeset conf
     for conf in \
+        /etc/conf.d/xdm \
         /etc/X11/xdm/xdm-config \
         /etc/X11/xdm/Xsession \
         /etc/X11/xdm/Xservers \
@@ -2035,6 +2114,15 @@ stage_validate() {
     else
         chmod +x /etc/X11/xdm/Xsession
         ui_ok "/etc/X11/xdm/Xsession execute bit corrected"
+    fi
+
+    ui_step "Validating OpenRC display manager selector"
+    if [ -f /etc/conf.d/xdm ] && grep -q '^DISPLAYMANAGER="xdm"$' /etc/conf.d/xdm 2>/dev/null; then
+        ui_ok "/etc/conf.d/xdm selects xdm"
+    else
+        ui_warn "/etc/conf.d/xdm is missing or does not select xdm"
+        log_warn "/etc/conf.d/xdm missing or DISPLAYMANAGER is not xdm"
+        val_ok=0
     fi
 
     ui_step "Validating OpenRC services"
@@ -2122,7 +2210,7 @@ stage_final_report() {
     print -- "  └────────────────────────────────────────────────────────────┘"
     print ""
     print -- "  ${C_BOLD}Next steps:${C_RST}"
-    print "    1. Reboot the machine"
+    print "    1. Reboot the machine, or run rc-service xdm restart"
     print "    2. XDM login screen will appear on tty7 / vt7"
     print "    3. Log in as '${TARGET_USER}' — Fluxbox will start"
     print "    4. Right-click the desktop for the application menu"
@@ -2152,17 +2240,35 @@ run_stage() {
     typeset fn_rc=$?
 
     if [ "${fn_rc}" -ne 0 ]; then
+        LAST_FAILED_STAGE="${tag}"
         ui_final_fail
         ui_fail "Stage failed: ${display}"
         log_error "Stage ${tag} returned non-zero: ${fn_rc}"
         print ""
-        print -- "  Re-run the script to resume from this point:"
+        print -- "  Resume command:"
         print -- "  ${SCRIPT_NAME} -u '${TARGET_USER}' -k '${KBD_LAYOUT}'${KBD_VARIANT:+ -V '${KBD_VARIANT}'}"
         print ""
-        exit 1
+        return "${fn_rc}"
     fi
 
     log_stage "END ${tag}: ${display}"
+    return 0
+}
+
+run_all_stages() {
+    run_stage "01_preflight"      "Preflight Validation"           stage_preflight || return 1
+    run_stage "02_hardware"       "Hardware Discovery"             stage_hardware || return 1
+    run_stage "03_packages"       "Package Installation"           stage_packages || return 1
+    run_stage "04_services"       "OpenRC Service Configuration"   stage_services || return 1
+    run_stage "05_graphics"       "Graphics and X11 Setup"         stage_graphics || return 1
+    run_stage "06_xdm"            "XDM Display Manager Setup"      stage_xdm || return 1
+    run_stage "07_fluxbox"        "Fluxbox Desktop Setup"          stage_fluxbox || return 1
+    run_stage "08_audio"          "Audio Configuration"            stage_audio || return 1
+    run_stage "09_keyboard"       "Keyboard Persistence"           stage_keyboard || return 1
+    run_stage "10_desktop_config" "Desktop Software Config"        stage_desktop_config || return 1
+    run_stage "11_user_env"       "User Environment Finalisation"  stage_user_env || return 1
+    run_stage "12_validate"       "Post-Install Validation"        stage_validate || return 1
+    run_stage "13_final_report"   "Final Report"                   stage_final_report || return 1
     return 0
 }
 
@@ -2176,29 +2282,50 @@ main() {
     if [ "${FORCE_RERUN}" -eq 1 ]; then
         ui_warn "Force rerun mode: all stage checkpoints will be ignored."
     fi
+    if [ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ]; then
+        ui_warn "Force reinstall mode: package stage will reinstall queued packages."
+    fi
+    if [ "${AUTO_RETRY_ON_ERROR}" -eq 1 ]; then
+        ui_warn "Auto retry mode: any stage failure restarts from stage 1 (max ${MAX_AUTO_RETRIES} attempts)."
+    fi
 
     if [ -d "${STATE_DIR}" ]; then
         chk_show_resume_status
     fi
 
-    run_stage "01_preflight"      "Preflight Validation"           stage_preflight
-    run_stage "02_hardware"       "Hardware Discovery"             stage_hardware
-    run_stage "03_packages"       "Package Installation"           stage_packages
-    run_stage "04_services"       "OpenRC Service Configuration"   stage_services
-    run_stage "05_graphics"       "Graphics and X11 Setup"         stage_graphics
-    run_stage "06_xdm"            "XDM Display Manager Setup"      stage_xdm
-    run_stage "07_fluxbox"        "Fluxbox Desktop Setup"          stage_fluxbox
-    run_stage "08_audio"          "Audio Configuration"            stage_audio
-    run_stage "09_keyboard"       "Keyboard Persistence"           stage_keyboard
-    run_stage "10_desktop_config" "Desktop Software Config"        stage_desktop_config
-    run_stage "11_user_env"       "User Environment Finalisation"  stage_user_env
-    run_stage "12_validate"       "Post-Install Validation"        stage_validate
-    run_stage "13_final_report"   "Final Report"                   stage_final_report
+    typeset attempt run_rc
+    attempt=1
+    while [ "${attempt}" -le "${MAX_AUTO_RETRIES}" ]; do
+        CURRENT_ATTEMPT="${attempt}"
+        LAST_FAILED_STAGE=""
+
+        if [ "${attempt}" -gt 1 ]; then
+            print ""
+            ui_warn "Retry attempt ${attempt}/${MAX_AUTO_RETRIES}: restarting from stage 1."
+            clear_stage_checkpoints
+            FORCE_RERUN=1
+            mkdir -p "${TMP_DIR}"
+        fi
+
+        run_all_stages
+        run_rc=$?
+        if [ "${run_rc}" -eq 0 ]; then
+            rm -rf "${TMP_DIR}" 2>/dev/null || true
+            ui_final_ok
+            return 0
+        fi
+
+        if [ "${AUTO_RETRY_ON_ERROR}" -ne 1 ] || [ "${attempt}" -ge "${MAX_AUTO_RETRIES}" ]; then
+            rm -rf "${TMP_DIR}" 2>/dev/null || true
+            return 1
+        fi
+
+        log_warn "Attempt ${attempt} failed at stage ${LAST_FAILED_STAGE}; restarting from beginning"
+        attempt=$(( attempt + 1 ))
+    done
 
     rm -rf "${TMP_DIR}" 2>/dev/null || true
-
-    ui_final_ok
-    return 0
+    return 1
 }
 
 trap '
