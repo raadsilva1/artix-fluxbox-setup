@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.8"
+readonly SCRIPT_VERSION="1.0.9"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -311,6 +311,17 @@ pkg_available() {
     pacman -Si "$1" >/dev/null 2>&1
 }
 
+pkg_provider_for_path() {
+    typeset target="$1" provider=""
+    provider=$(pacman -Fq "${target}" 2>/dev/null | head -1 | tr -d '[:space:]')
+    if [ -z "${provider}" ]; then
+        run_cmd_quiet "pacman -Fy" pacman -Fy --noconfirm
+        provider=$(pacman -Fq "${target}" 2>/dev/null | head -1 | tr -d '[:space:]')
+    fi
+    [ -n "${provider}" ] || return 1
+    print -- "${provider}"
+}
+
 svc_exists() {
     [ -f "/etc/init.d/$1" ]
 }
@@ -324,9 +335,20 @@ svc_enable() {
     typeset svc="$1" runlevel="${2:-default}"
     if ! svc_enabled "${svc}" "${runlevel}"; then
         run_cmd_quiet "Enable ${svc}@${runlevel}" rc-update add "${svc}" "${runlevel}"
-        if [ "${RC}" -eq 0 ]; then
+        if [ "${RC}" -eq 0 ] && svc_enabled "${svc}" "${runlevel}"; then
             log_svc "Enabled: ${svc} in runlevel ${runlevel}"
             ui_ok "Service enabled: ${svc} (${runlevel})"
+            return 0
+        fi
+
+        if svc_exists "${svc}"; then
+            mkdir -p "/etc/runlevels/${runlevel}" 2>/dev/null || true
+            ln -sf "/etc/init.d/${svc}" "/etc/runlevels/${runlevel}/${svc}" 2>/dev/null || true
+        fi
+
+        if svc_enabled "${svc}" "${runlevel}"; then
+            log_svc "Enabled via symlink fallback: ${svc} in runlevel ${runlevel}"
+            ui_ok "Service enabled via fallback: ${svc} (${runlevel})"
         else
             log_warn "Failed to enable service: ${svc}"
             ui_warn "Could not enable service: ${svc}"
@@ -383,16 +405,11 @@ svc_start_or_restart() {
 }
 
 resolve_xdm_service_name() {
-    typeset candidate found
-    for candidate in xdm xorg-xdm; do
-        if svc_exists "${candidate}"; then
-            print -- "${candidate}"
-            return 0
-        fi
-    done
-    found=$(find /etc/init.d -maxdepth 1 -type f \( -name 'xdm' -o -name 'xorg-xdm' \) 2>/dev/null | head -1)
-    [ -n "${found}" ] || return 1
-    basename "${found}"
+    if svc_exists xdm; then
+        print -- "xdm"
+        return 0
+    fi
+    return 1
 }
 
 xdm_server_path() {
@@ -415,14 +432,13 @@ xdm_server_path() {
 }
 
 xdm_activate_required() {
-    typeset xdm_svc
-    xdm_svc=$(resolve_xdm_service_name) || {
-        log_error "XDM init script not found during activation"
-        ui_fail "XDM init script not found during activation"
+    if ! svc_exists xdm; then
+        log_error "Required /etc/init.d/xdm is missing during activation"
+        ui_fail "Required /etc/init.d/xdm is missing during activation"
         return 1
-    }
+    fi
 
-    svc_require_enabled "${xdm_svc}" default || return 1
+    svc_require_enabled xdm default || return 1
 
     if [ ! -f /etc/conf.d/xdm ] || ! grep -q '^DISPLAYMANAGER="xdm"$' /etc/conf.d/xdm 2>/dev/null; then
         log_error "/etc/conf.d/xdm missing or does not select xdm"
@@ -430,21 +446,18 @@ xdm_activate_required() {
         return 1
     fi
 
-    if svc_start_or_restart "${xdm_svc}"; then
-        ui_ok "XDM service active: ${xdm_svc}"
-        log_svc "XDM active: ${xdm_svc}"
+    if svc_start_or_restart xdm; then
+        ui_ok "XDM service active: xdm"
+        log_svc "XDM active: xdm"
         return 0
     fi
 
-    if [ "${xdm_svc}" != "xdm" ] && svc_exists xdm; then
-        ui_warn "Primary XDM service '${xdm_svc}' failed; trying fallback 'xdm'"
-        log_warn "XDM activation fallback: ${xdm_svc} -> xdm"
-        svc_require_enabled xdm default || return 1
-        if svc_start_or_restart xdm; then
-            ui_ok "XDM service active via fallback: xdm"
-            log_svc "XDM active via fallback: xdm"
-            return 0
-        fi
+    run_cmd_quiet "Stop xdm" rc-service xdm stop
+    sleep 1
+    if svc_start_or_restart xdm; then
+        ui_ok "XDM service active after stop/start fallback: xdm"
+        log_svc "XDM active after stop/start fallback: xdm"
+        return 0
     fi
 
     log_error "XDM service could not be started successfully"
@@ -1106,11 +1119,59 @@ stage_packages() {
             critical_ok=0
         fi
     done
+    if ! command -v xdm >/dev/null 2>&1; then
+        ui_fail "Critical binary missing: xdm"
+        log_error "xdm binary missing after package installation"
+        critical_ok=0
+    fi
     if [ "${critical_ok}" -eq 0 ]; then
         ui_fatal "One or more critical packages failed to install. Check log, package status file, and network."
         return 1
     fi
     ui_ok "Critical packages verified"
+
+    ui_step "Ensuring /etc/init.d/xdm exists"
+    typeset xdm_provider=""
+    if ! svc_exists xdm; then
+        xdm_provider=$(pkg_provider_for_path /etc/init.d/xdm) || {
+            ui_fatal "Cannot find a package provider for /etc/init.d/xdm. Refresh mirrors or inspect pacman -F /etc/init.d/xdm."
+            log_error "No package provider found for /etc/init.d/xdm"
+            return 1
+        }
+        ui_info "Package providing /etc/init.d/xdm: ${xdm_provider}"
+
+        if [ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ]; then
+            run_cmd_quiet "Reinstall ${xdm_provider}" pacman -S --noconfirm "${xdm_provider}"
+            if [ "${RC}" -eq 0 ]; then
+                pkg_status_record "${xdm_provider}" "reinstalled" "provider for /etc/init.d/xdm"
+                ui_ok "Reinstalled XDM init provider: ${xdm_provider}"
+            else
+                pkg_status_record "${xdm_provider}" "reinstall_failed" "provider for /etc/init.d/xdm"
+                ui_fatal "Failed to reinstall the package provider for /etc/init.d/xdm: ${xdm_provider}"
+                return 1
+            fi
+        elif pkg_installed "${xdm_provider}"; then
+            pkg_status_record "${xdm_provider}" "present" "/etc/init.d/xdm provider already installed"
+            ui_skip "XDM init provider already installed: ${xdm_provider}"
+        else
+            run_cmd_quiet "Install ${xdm_provider}" pacman -S --noconfirm --needed "${xdm_provider}"
+            if [ "${RC}" -eq 0 ]; then
+                pkg_status_record "${xdm_provider}" "installed" "provider for /etc/init.d/xdm"
+                ui_ok "Installed XDM init provider: ${xdm_provider}"
+            else
+                pkg_status_record "${xdm_provider}" "install_failed" "provider for /etc/init.d/xdm"
+                ui_fatal "Failed to install the package provider for /etc/init.d/xdm: ${xdm_provider}"
+                return 1
+            fi
+        fi
+    fi
+
+    if ! svc_exists xdm; then
+        ui_fatal "Required /etc/init.d/xdm is still missing after package installation."
+        log_error "/etc/init.d/xdm still missing after provider handling"
+        return 1
+    fi
+    ui_ok "XDM init script present: /etc/init.d/xdm"
 
     typeset xkb_sym_dir="/usr/share/X11/xkb/symbols"
     if [ -d "${xkb_sym_dir}" ] && [ ! -f "${xkb_sym_dir}/${KBD_LAYOUT}" ]; then
@@ -1139,16 +1200,15 @@ stage_services() {
     done
 
     ui_step "Resolving required XDM service"
-    typeset xdm_svc
-    xdm_svc=$(resolve_xdm_service_name) || {
-        ui_fatal "Cannot locate XDM init script under /etc/init.d. XDM is a hard requirement."
-        log_error "XDM init script not found anywhere in /etc/init.d"
+    if ! svc_exists xdm; then
+        ui_fatal "Required /etc/init.d/xdm is missing. Package stage should have installed its provider."
+        log_error "/etc/init.d/xdm missing before service enablement"
         return 1
-    }
-    ui_ok "XDM init script: ${xdm_svc}"
+    fi
+    ui_ok "XDM init script: xdm"
 
     ui_step "Enabling required XDM service"
-    svc_require_enabled "${xdm_svc}" default || return 1
+    svc_require_enabled xdm default || return 1
 
     ui_step "Configuring NetworkManager service"
     if svc_exists NetworkManager; then
@@ -1310,12 +1370,12 @@ stage_xdm() {
     typeset xdm_vardir="/var/lib/xdm"
     typeset xdm_confdir="/etc/conf.d"
     typeset xdm_service_conf="${xdm_confdir}/xdm"
-    typeset x_server_bin xdm_svc
+    typeset x_server_bin
 
-    xdm_svc=$(resolve_xdm_service_name) || {
-        ui_fatal "Cannot locate XDM init script. XDM is a hard requirement."
+    if ! svc_exists xdm; then
+        ui_fatal "Cannot locate /etc/init.d/xdm. XDM is a hard requirement."
         return 1
-    }
+    fi
 
     if ! command -v xdm >/dev/null 2>&1; then
         ui_fatal "The xdm binary is missing even though XDM is required. Ensure xorg-xdm installed correctly."
@@ -2242,20 +2302,17 @@ stage_validate() {
     fi
 
     ui_step "Validating required XDM service registration"
-    typeset xdm_svc svc
-    xdm_svc=$(resolve_xdm_service_name) || {
-        ui_fail "XDM init script is missing"
-        log_error "XDM init script missing during validation"
+    typeset svc
+    if ! svc_exists xdm; then
+        ui_fail "Required /etc/init.d/xdm is missing"
+        log_error "/etc/init.d/xdm missing during validation"
         val_ok=0
-    }
-    if [ -n "${xdm_svc:-}" ]; then
-        if svc_enabled "${xdm_svc}" default 2>/dev/null || svc_enabled "${xdm_svc}" boot 2>/dev/null; then
-            ui_ok "Required XDM service enabled: ${xdm_svc}"
-        else
-            ui_fail "Required XDM service is not enabled: ${xdm_svc}"
-            log_error "Required XDM service is not enabled: ${xdm_svc}"
-            val_ok=0
-        fi
+    elif svc_enabled xdm default 2>/dev/null || svc_enabled xdm boot 2>/dev/null; then
+        ui_ok "Required XDM service enabled: xdm"
+    else
+        ui_fail "Required XDM service is not enabled: xdm"
+        log_error "Required XDM service is not enabled: xdm"
+        val_ok=0
     fi
 
     ui_step "Validating optional OpenRC services"
@@ -2325,13 +2382,12 @@ stage_final_report() {
     ui_stage "13" "Final Report"
     log_stage "FINAL_REPORT"
 
-    typeset stage_count=0 done_count=0 f tag ts xdm_svc xdm_state
-    xdm_svc=$(resolve_xdm_service_name 2>/dev/null || true)
+    typeset stage_count=0 done_count=0 f tag ts xdm_state
     xdm_state="not detected"
-    if [ -n "${xdm_svc}" ] && rc-service "${xdm_svc}" status >/dev/null 2>&1; then
-        xdm_state="active (${xdm_svc})"
-    elif [ -n "${xdm_svc}" ]; then
-        xdm_state="enabled or configured, not active (${xdm_svc})"
+    if svc_exists xdm && rc-service xdm status >/dev/null 2>&1; then
+        xdm_state="active (xdm)"
+    elif svc_exists xdm; then
+        xdm_state="enabled or configured, not active (xdm)"
     fi
     for f in "${STATE_DIR}"/stage_*.done; do
         [ -f "${f}" ] || continue
