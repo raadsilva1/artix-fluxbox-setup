@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.12.2"
+readonly SCRIPT_VERSION="1.0.14.0"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -1681,8 +1681,8 @@ FBSTART
 
     ui_step "Writing ~/.fluxbox/init (main settings)"
     write_user_file "${fb_dir}/init" "644" <<FBINIT
-session.screen0.workspaces: 4
-session.screen0.workspaceNames: Main,Work,Media,Dev
+session.screen0.workspaces: 8
+session.screen0.workspaceNames: Space 1,Space 2,Space 3,Space 4,Space 5,Space 6,Space 7,Space 8
 session.screen0.toolbar.visible: true
 session.screen0.toolbar.placement: BottomCenter
 session.screen0.toolbar.widthPercent: 100
@@ -1741,19 +1741,30 @@ OnWindow Mod1 Mouse3 :StartResizing NearestCorner
 OnWindow Mouse2 :StartMoving
 
 # Workspace switching (keyboard)
-Mod4 1  :Workspace 1
-Mod4 2  :Workspace 2
-Mod4 3  :Workspace 3
-Mod4 4  :Workspace 4
+Control Mod1 Left   :PrevWorkspace
+Control Mod1 Right  :NextWorkspace
 
-Mod4 Left   :PrevWorkspace
-Mod4 Right  :NextWorkspace
+Mod4 Left           :PrevWorkspace
+Mod4 Right          :NextWorkspace
+
+Mod4 1              :Workspace 1
+Mod4 2              :Workspace 2
+Mod4 3              :Workspace 3
+Mod4 4              :Workspace 4
+Mod4 5              :Workspace 5
+Mod4 6              :Workspace 6
+Mod4 7              :Workspace 7
+Mod4 8              :Workspace 8
 
 # Move window to workspace
-Mod4 Shift 1  :SendToWorkspace 1
-Mod4 Shift 2  :SendToWorkspace 2
-Mod4 Shift 3  :SendToWorkspace 3
-Mod4 Shift 4  :SendToWorkspace 4
+Mod4 Shift 1        :SendToWorkspace 1
+Mod4 Shift 2        :SendToWorkspace 2
+Mod4 Shift 3        :SendToWorkspace 3
+Mod4 Shift 4        :SendToWorkspace 4
+Mod4 Shift 5        :SendToWorkspace 5
+Mod4 Shift 6        :SendToWorkspace 6
+Mod4 Shift 7        :SendToWorkspace 7
+Mod4 Shift 8        :SendToWorkspace 8
 
 # Window management
 Mod4 F4         :Close
@@ -2491,7 +2502,9 @@ stage_final_report() {
     print "    2. If the login screen is not visible yet, switch to tty7 / vt7 or reboot once"
     print "    3. Log in as '${TARGET_USER}' — Fluxbox will start"
     print "    4. Right-click the desktop for the application menu"
-    print "    5. Super+T opens a terminal (XTerm)"
+    print "    5. Ctrl+Alt+Left/Right and Super+Left/Right switch workspaces"
+    print "    6. Super+1..8 jumps to a workspace; Super+Shift+1..8 sends a window there"
+    print "    7. Super+T opens a terminal (XTerm)"
     print ""
     print "    If audio is silent: run  ${C_BOLD}pavucontrol${C_RST}  from the menu"
     print "    Log file for troubleshooting: ${LOGFILE}"
