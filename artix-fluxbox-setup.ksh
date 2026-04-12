@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.10"
+readonly SCRIPT_VERSION="1.0.11.1"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -1666,18 +1666,11 @@ XSESS
     ui_step "Writing ~/.fluxbox/startup"
     write_user_file "${fb_dir}/startup" "755" <<'FBSTART'
 #!/bin/sh
-# Fluxbox startup script — managed by artix-fluxbox-setup.ksh
-# This file is sourced by Fluxbox at session start.
-# Add per-session startup commands here.
-
-# Optionally set background via feh if a wallpaper image exists
 if [ -f "${HOME}/.fluxbox/background.png" ]; then
     feh --bg-scale "${HOME}/.fluxbox/background.png" &
 elif [ -f "${HOME}/.fluxbox/background.jpg" ]; then
     feh --bg-scale "${HOME}/.fluxbox/background.jpg" &
 fi
-
-exec fluxbox
 FBSTART
     ui_ok "~/.fluxbox/startup written"
 
