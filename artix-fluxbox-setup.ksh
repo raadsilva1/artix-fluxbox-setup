@@ -1633,6 +1633,11 @@ FBSTYLE
 #!/bin/sh
 # ${TARGET_USER} XDM session — managed by ${SCRIPT_NAME}
 
+# Load persistent X resources for this login session
+if command -v xrdb >/dev/null 2>&1 && [ -f "${HOME}/.Xresources" ]; then
+    xrdb -merge "${HOME}/.Xresources" 2>/dev/null || true
+fi
+
 # Set keyboard layout
 setxkbmap -layout "${KBD_LAYOUT}" -model "${KBD_MODEL}" ${variant_arg} ${options_arg} 2>/dev/null || true
 
