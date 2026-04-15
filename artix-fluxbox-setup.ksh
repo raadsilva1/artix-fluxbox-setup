@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.14.1"
+readonly SCRIPT_VERSION="1.0.14.2"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -1684,8 +1684,8 @@ FBSTYLE
 # ${TARGET_USER} XDM session — managed by ${SCRIPT_NAME}
 
 # Load persistent X resources for this login session
-if command -v xrdb >/dev/null 2>&1 && [ -f "${HOME}/.Xresources" ]; then
-    xrdb -merge "${HOME}/.Xresources" 2>/dev/null || true
+if command -v xrdb >/dev/null 2>&1 && [ -f "\${HOME}/.Xresources" ]; then
+    xrdb -merge "\${HOME}/.Xresources" 2>/dev/null || true
 fi
 
 # Set keyboard layout
@@ -2431,7 +2431,7 @@ stage_validate() {
     fi
 
     ui_step "Validating persistent Xresources activation path"
-    if grep -q 'xrdb -merge "${HOME}/.Xresources"' "${TARGET_HOME}/.xsession" 2>/dev/null; then
+    if grep -Eq 'xrdb -merge "(\$\{HOME\}|\$HOME|${TARGET_HOME})/\.Xresources"' "${TARGET_HOME}/.xsession" 2>/dev/null; then
         ui_ok "~/.xsession loads ~/.Xresources via xrdb"
     else
         ui_fail "~/.xsession does not load ~/.Xresources via xrdb"
