@@ -5,7 +5,7 @@ set +e
 set -o nounset
 
 readonly SCRIPT_NAME="artix-fluxbox-setup.ksh"
-readonly SCRIPT_VERSION="1.0.14.0"
+readonly SCRIPT_VERSION="1.0.14.1"
 readonly SCRIPT_PID=$$
 
 readonly STATE_DIR="/var/lib/artix-fluxbox-setup"
@@ -954,6 +954,9 @@ build_package_list() {
     PKGS=( "${PKGS[@]}"
         xterm
     )
+    if pkg_available xorg-xrdb; then
+        PKGS=( "${PKGS[@]}" xorg-xrdb )
+    fi
 
     PKGS=( "${PKGS[@]}"
         alsa-utils
@@ -1129,6 +1132,10 @@ stage_packages() {
         log_error "xdm binary missing after package installation"
         critical_ok=0
     fi
+    if ! command -v xrdb >/dev/null 2>&1; then
+        ui_warn "xrdb binary not yet present after base package installation"
+        log_warn "xrdb binary missing after base package installation"
+    fi
     if [ "${critical_ok}" -eq 0 ]; then
         ui_fatal "One or more critical packages failed to install. Check log, package status file, and network."
         return 1
@@ -1177,6 +1184,49 @@ stage_packages() {
         return 1
     fi
     ui_ok "XDM init script present: /etc/init.d/xdm"
+
+    ui_step "Ensuring xrdb is present for persistent XTerm theme activation"
+    typeset xrdb_provider=""
+    if ! command -v xrdb >/dev/null 2>&1; then
+        xrdb_provider=$(pkg_provider_for_path /usr/bin/xrdb) || {
+            ui_fatal "Cannot find a package provider for /usr/bin/xrdb. Refresh mirrors or inspect pacman -F /usr/bin/xrdb."
+            log_error "No package provider found for /usr/bin/xrdb"
+            return 1
+        }
+        ui_info "Package providing /usr/bin/xrdb: ${xrdb_provider}"
+
+        if [ "${FORCE_REINSTALL_PACKAGES}" -eq 1 ]; then
+            run_cmd_quiet "Reinstall ${xrdb_provider}" pacman -S --noconfirm "${xrdb_provider}"
+            if [ "${RC}" -eq 0 ]; then
+                pkg_status_record "${xrdb_provider}" "reinstalled" "provider for /usr/bin/xrdb"
+                ui_ok "Reinstalled xrdb provider: ${xrdb_provider}"
+            else
+                pkg_status_record "${xrdb_provider}" "reinstall_failed" "provider for /usr/bin/xrdb"
+                ui_fatal "Failed to reinstall the package provider for /usr/bin/xrdb: ${xrdb_provider}"
+                return 1
+            fi
+        elif pkg_installed "${xrdb_provider}"; then
+            pkg_status_record "${xrdb_provider}" "present" "/usr/bin/xrdb provider already installed"
+            ui_skip "xrdb provider already installed: ${xrdb_provider}"
+        else
+            run_cmd_quiet "Install ${xrdb_provider}" pacman -S --noconfirm --needed "${xrdb_provider}"
+            if [ "${RC}" -eq 0 ]; then
+                pkg_status_record "${xrdb_provider}" "installed" "provider for /usr/bin/xrdb"
+                ui_ok "Installed xrdb provider: ${xrdb_provider}"
+            else
+                pkg_status_record "${xrdb_provider}" "install_failed" "provider for /usr/bin/xrdb"
+                ui_fatal "Failed to install the package provider for /usr/bin/xrdb: ${xrdb_provider}"
+                return 1
+            fi
+        fi
+    fi
+
+    if ! command -v xrdb >/dev/null 2>&1; then
+        ui_fatal "Required binary xrdb is still missing after package installation. XTerm theme persistence cannot work safely."
+        log_error "xrdb still missing after provider handling"
+        return 1
+    fi
+    ui_ok "xrdb present: $(command -v xrdb)"
 
     typeset xkb_sym_dir="/usr/share/X11/xkb/symbols"
     if [ -d "${xkb_sym_dir}" ] && [ ! -f "${xkb_sym_dir}/${KBD_LAYOUT}" ]; then
@@ -2280,9 +2330,15 @@ XINITRC
     fi
 
     if [ -n "${DISPLAY:-}" ]; then
+        typeset xauthority_file="${XAUTHORITY:-${TARGET_HOME}/.Xauthority}"
         run_cmd_quiet "xrdb merge .Xresources" \
-            su -c "xrdb -merge '${TARGET_HOME}/.Xresources'" "${TARGET_USER}" 2>/dev/null || true
-        ui_info "Xresources merged into running X session"
+            su -c "DISPLAY='${DISPLAY}' XAUTHORITY='${xauthority_file}' HOME='${TARGET_HOME}' xrdb -merge '${TARGET_HOME}/.Xresources'" "${TARGET_USER}" 2>/dev/null || true
+        if [ "${RC}" -eq 0 ]; then
+            ui_info "Xresources merged into running X session"
+        else
+            ui_warn "Could not merge Xresources into the running X session now; persistence on next login remains configured."
+            log_warn "Runtime xrdb merge failed for DISPLAY=${DISPLAY} XAUTHORITY=${xauthority_file}"
+        fi
     fi
 
     ui_step "Initialising hardware sensors"
@@ -2324,14 +2380,14 @@ stage_validate() {
 
     ui_step "Validating critical binaries"
     typeset binary
-    for binary in X xdm fluxbox xterm feh dunst nm-applet amixer pipewire; do
+    for binary in X xdm fluxbox xterm xrdb feh dunst nm-applet amixer pipewire; do
         if command -v "${binary}" >/dev/null 2>&1; then
             log_info "Binary OK: ${binary} ($(command -v "${binary}"))"
         else
             ui_warn "Binary not found: ${binary}"
             log_warn "Binary missing: ${binary}"
             case "${binary}" in
-                X|xdm|fluxbox|xterm|amixer)
+                X|xdm|fluxbox|xterm|xrdb|amixer)
                     ui_fail "CRITICAL binary missing: ${binary}"
                     val_ok=0
                     ;;
@@ -2372,6 +2428,43 @@ stage_validate() {
         log_error "~/.xsession missing execute bit"
         chmod +x "${TARGET_HOME}/.xsession"
         ui_ok "~/.xsession execute bit corrected"
+    fi
+
+    ui_step "Validating persistent Xresources activation path"
+    if grep -q 'xrdb -merge "${HOME}/.Xresources"' "${TARGET_HOME}/.xsession" 2>/dev/null; then
+        ui_ok "~/.xsession loads ~/.Xresources via xrdb"
+    else
+        ui_fail "~/.xsession does not load ~/.Xresources via xrdb"
+        log_error "~/.xsession missing xrdb merge for ~/.Xresources"
+        val_ok=0
+    fi
+
+    ui_step "Validating managed XTerm resource entries"
+    if grep -q '^XTerm\*background:[[:space:]]*#1a1a2e$' "${TARGET_HOME}/.Xresources" 2>/dev/null && \
+       grep -q '^XTerm\*foreground:[[:space:]]*#c8ccd4$' "${TARGET_HOME}/.Xresources" 2>/dev/null; then
+        ui_ok "~/.Xresources contains managed XTerm colours"
+    else
+        ui_fail "~/.Xresources does not contain the expected managed XTerm colours"
+        log_error "~/.Xresources missing expected XTerm colour entries"
+        val_ok=0
+    fi
+
+    if [ -n "${DISPLAY:-}" ]; then
+        ui_step "Validating loaded X resource database for the active session"
+        typeset runtime_xauthority="${XAUTHORITY:-${TARGET_HOME}/.Xauthority}"
+        typeset xrdb_query_out="${TMP_DIR}/xrdb_query.$$"
+        su -c "DISPLAY='${DISPLAY}' XAUTHORITY='${runtime_xauthority}' HOME='${TARGET_HOME}' xrdb -query" "${TARGET_USER}" > "${xrdb_query_out}" 2>/dev/null
+        if [ $? -eq 0 ] && grep -q '^XTerm\*background:[[:space:]]*#1a1a2e$' "${xrdb_query_out}" 2>/dev/null; then
+            ui_ok "Active X session has the managed XTerm background loaded"
+            log_info "xrdb runtime query confirmed managed XTerm resources"
+        else
+            ui_warn "Could not confirm managed XTerm resources in the active X session"
+            log_warn "xrdb runtime query could not confirm managed XTerm resources"
+        fi
+        rm -f "${xrdb_query_out}" 2>/dev/null || true
+    else
+        ui_info "No active DISPLAY available; runtime xrdb query skipped"
+        log_info "Skipped runtime xrdb query because DISPLAY is not set"
     fi
 
     if [ -x /etc/X11/xdm/Xsession ]; then
